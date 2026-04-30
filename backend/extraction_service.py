@@ -122,6 +122,8 @@ class ExtractionCoordinator:
             # Etapa 2: PROCESSA E GRAVA PÁGINA POR PÁGINA
             total_resumos_salvos = 0
             consecutive_empty_pages = 0
+            mem_resumos = {}  # Fallback na memoria
+            mem_cc = []       # Fallback na memoria
             
             # Lista de palavras-chave que indicam o FIM do extrato útil (Rodapés/Legais)
             # Ao encontrar estas palavras em uma página SEM resumos, interrompemos a busca.
@@ -159,6 +161,9 @@ class ExtractionCoordinator:
                                 header=header,
                                 transacao=tx
                             )
+                            # Adiciona fallback in-memory (compativel c/ DB)
+                            tx_mem = {**header, **tx, "pagina": page_num}
+                            mem_cc.append(tx_mem)
                         logger.info(f"✓ Pagina {page_num}: {len(cc_result['transacoes'])} lançamentos de CC GRAVADOS")
                 except Exception as cc_err:
                     logger.error(f"Página {page_num}: Erro ao processar CC: {cc_err}")
@@ -258,6 +263,12 @@ class ExtractionCoordinator:
                             campos=campos,
                             data_processamento=data_processamento_unica
                         )
+                        # Guarda na memoria tb para degradacao do banco
+                        mem_resumos[page_num] = {
+                            "tipo": "RESUMO_MENSAL",
+                            "pagina": page_num,
+                            "campos": campos
+                        }
                         total_resumos_salvos += 1
                         await progress.update_parser(page_num, len(page_texts), True)
                         logger.info(f"✓ Pagina {page_num}: Resumo mensal GRAVADO no banco")
@@ -290,8 +301,17 @@ class ExtractionCoordinator:
             logger.info("\nLENDO DADOS DO BANCO...")
             resumos_db = self.db.listar_resumos_mensais(arquivo_nome)
             movimentacoes_cc = self.db.listar_movimentacoes_cc(arquivo_nome)
+            
+            # Fallback caso Banco esteja offline
+            if not resumos_db and total_resumos_salvos > 0:
+                logger.info("Usando resumos em memoria (banco offline/ausente)")
+                resumos_db = mem_resumos
+                
+            if not movimentacoes_cc and mem_cc:
+                logger.info("Usando transacoes CC em memoria (banco offline/ausente)")
+                movimentacoes_cc = mem_cc
 
-            logger.info(f"✓ Lidos {len(resumos_db)} resumos + {len(movimentacoes_cc)} transações CC do banco")
+            logger.info(f"✓ Lidos/Em Memória: {len(resumos_db)} resumos + {len(movimentacoes_cc)} transações CC")
 
             # Log de auditoria: compara gravado vs lido
             if len(resumos_db) != total_resumos_salvos:
