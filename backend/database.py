@@ -1,88 +1,129 @@
-import sqlite3
+import pymysql
+import pymysql.cursors
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 import logging
 import json
+import os
+from dotenv import load_dotenv
+# Carrega .env do diretório raiz do projeto (um nível acima de /backend)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ENV_PATH = os.path.join(BASE_DIR, ".env")
+load_dotenv(ENV_PATH, override=True)
 
 logger = logging.getLogger(__name__)
+
+# Log de auditoria de configuração (seguro)
+db_host = os.getenv("MYSQL_HOST", "localhost")
+db_user = os.getenv("MYSQL_USER", "root")
+db_name = os.getenv("MYSQL_DATABASE", "convenio2")
+logger.info(f"DB CONFIG: Host={db_host}, User={db_user}, DB={db_name} (Loaded from {ENV_PATH})")
 
 
 class ExtractionDatabase:
     """
-    Banco de dados SQLite para armazenar todas as extracoes
-    Isso elimina alucinacoes e cria um historico confiavel
+    Banco de dados MySQL para armazenar todas as extrações
+    Substitui o SQLite para maior robustez e escalabilidade
     """
     
-    def __init__(self, db_path: str = "extractions.db"):
-        self.db_path = db_path
+    def __init__(self):
+        self.host = os.getenv("MYSQL_HOST", "localhost")
+        self.port = int(os.getenv("MYSQL_PORT", 3306))
+        self.user = os.getenv("MYSQL_USER", "root")
+        self.password = os.getenv("MYSQL_PASSWORD", "")
+        self.database = os.getenv("MYSQL_DATABASE", "convenio2")
         self._init_database()
     
+    def _get_connection(self):
+        return pymysql.connect(
+            host=self.host,
+            user=self.user,
+            password=self.password,
+            database=self.database,
+            port=self.port,
+            cursorclass=pymysql.cursors.DictCursor,
+            autocommit=True
+        )
+    
     def _init_database(self):
-        """Cria as tabelas se nao existirem"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Tabela principal de extrações
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS extracoes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                arquivo_nome TEXT NOT NULL,
-                data_processamento TEXT NOT NULL,
-                campo TEXT NOT NULL,
-                valor REAL NOT NULL,
-                data_extracao TEXT NOT NULL,
-                pagina INTEGER NOT NULL,
-                linha_ocr TEXT,
-                confianca TEXT,
-                status TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Nova tabela para resumos mensais
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS resumos_mensais (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                arquivo_nome TEXT NOT NULL,
-                data_processamento TEXT NOT NULL,
-                pagina INTEGER NOT NULL,
-                saldo_anterior REAL,
-                aplicacoes REAL,
-                resgates REAL,
-                rendimento_bruto REAL,
-                imposto_renda REAL,
-                iof REAL,
-                rendimento_liquido REAL,
-                saldo_atual REAL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(arquivo_nome, data_processamento, pagina)
-            )
-        """)
-        
-        # Índices para busca rápida
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_arquivo 
-            ON extracoes(arquivo_nome)
-        """)
-        
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_data_processamento 
-            ON extracoes(data_processamento)
-        """)
-        
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_campo 
-            ON extracoes(campo)
-        """)
-        
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_resumos_arquivo 
-            ON resumos_mensais(arquivo_nome)
-        """)
-        
-        conn.commit()
-        conn.close()
-        logger.info(f"Banco de dados inicializado: {self.db_path}")
+        """Inicializa as tabelas se não existirem (no MySQL)"""
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            # Tabela principal de extrações
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS extracoes (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    arquivo_nome VARCHAR(255) NOT NULL,
+                    data_processamento VARCHAR(100) NOT NULL,
+                    campo VARCHAR(100) NOT NULL,
+                    valor DECIMAL(15, 2) NOT NULL,
+                    data_extracao VARCHAR(100) NOT NULL,
+                    pagina INT NOT NULL,
+                    linha_ocr TEXT,
+                    confianca VARCHAR(50),
+                    status VARCHAR(50),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_arquivo (arquivo_nome),
+                    INDEX idx_data_processamento (data_processamento),
+                    INDEX idx_campo (campo)
+                ) ENGINE=InnoDB
+            """)
+            
+            # Tabela para resumos mensais
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS resumos_mensais (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    arquivo_nome VARCHAR(255) NOT NULL,
+                    data_processamento VARCHAR(100) NOT NULL,
+                    pagina INT NOT NULL,
+                    saldo_anterior DECIMAL(15, 2),
+                    aplicacoes DECIMAL(15, 2),
+                    resgates DECIMAL(15, 2),
+                    rendimento_bruto DECIMAL(15, 2),
+                    imposto_renda DECIMAL(15, 2),
+                    iof DECIMAL(15, 2),
+                    rendimento_liquido DECIMAL(15, 2),
+                    saldo_atual DECIMAL(15, 2),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY uk_resumo (arquivo_nome, data_processamento, pagina),
+                    INDEX idx_resumos_arquivo (arquivo_nome)
+                ) ENGINE=InnoDB
+            """)
+            
+            # Tabela de movimentações de conta corrente
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS movimentacoes_cc (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    arquivo_nome VARCHAR(255) NOT NULL,
+                    data_processamento VARCHAR(100) NOT NULL,
+                    pagina INT NOT NULL,
+                    agencia VARCHAR(50),
+                    conta VARCHAR(50),
+                    titular VARCHAR(255),
+                    periodo VARCHAR(100),
+                    data_balancete VARCHAR(50),
+                    data_movimento VARCHAR(50),
+                    historico TEXT,
+                    valor DECIMAL(15, 2),
+                    valor_tipo CHAR(1),
+                    saldo DECIMAL(15, 2),
+                    saldo_tipo CHAR(1),
+                    documento VARCHAR(100),
+                    raw_line TEXT,
+                    editado_manualmente TINYINT(1) DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_cc_arquivo (arquivo_nome)
+                ) ENGINE=InnoDB
+            """)
+
+            conn.close()
+            logger.info("✅ MySQL Conectado e Tabelas Verificadas.")
+        except Exception as e:
+            logger.error(f"❌ ERRO CRÍTICO NA CONEXÃO MYSQL: {e}")
+            # Não levantamos erro aqui para não travar o backend no init, 
+            # mas as chamadas futuras falharão com logs claros.
     
     def salvar_extracao(
         self,
@@ -97,14 +138,14 @@ class ExtractionDatabase:
         status: str = "SUCESSO"
     ) -> int:
         """Salva uma extração no banco"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         
         cursor.execute("""
             INSERT INTO extracoes 
             (arquivo_nome, data_processamento, campo, valor, data_extracao, 
              pagina, linha_ocr, confianca, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             arquivo_nome,
             data_processamento,
@@ -118,7 +159,6 @@ class ExtractionDatabase:
         ))
         
         extraction_id = cursor.lastrowid
-        conn.commit()
         conn.close()
         
         return extraction_id
@@ -135,11 +175,11 @@ class ExtractionDatabase:
         data_processamento = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         total_salvos = 0
         
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         
         # REMOVE extrações antigas deste arquivo (evita duplicatas)
-        cursor.execute("DELETE FROM extracoes WHERE arquivo_nome = ?", (arquivo_nome,))
+        cursor.execute("DELETE FROM extracoes WHERE arquivo_nome = %s", (arquivo_nome,))
         linhas_removidas = cursor.rowcount
         if linhas_removidas > 0:
             logger.info(f"Removidas {linhas_removidas} extracoes antigas de {arquivo_nome}")
@@ -150,7 +190,7 @@ class ExtractionDatabase:
                     INSERT INTO extracoes 
                     (arquivo_nome, data_processamento, campo, valor, data_extracao, 
                      pagina, linha_ocr, confianca, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     arquivo_nome,
                     data_processamento,
@@ -164,7 +204,6 @@ class ExtractionDatabase:
                 ))
                 total_salvos += 1
         
-        conn.commit()
         conn.close()
         
         logger.info(f"Salvos {total_salvos} registros no banco para {arquivo_nome}")
@@ -172,14 +211,14 @@ class ExtractionDatabase:
     
     def listar_ultima_extracao(self, arquivo_nome: str) -> List[Dict[str, Any]]:
         """Lista a última extração de um arquivo específico"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         
         # Busca a última data de processamento deste arquivo
         cursor.execute("""
             SELECT DISTINCT data_processamento 
             FROM extracoes 
-            WHERE arquivo_nome = ?
+            WHERE arquivo_nome = %s
             ORDER BY data_processamento DESC
             LIMIT 1
         """, (arquivo_nome,))
@@ -189,37 +228,24 @@ class ExtractionDatabase:
             conn.close()
             return []
         
-        ultima_data = result[0]
+        ultima_data = result['data_processamento']
         
         # Busca todos os registros desta extração
         cursor.execute("""
             SELECT id, campo, valor, data_extracao, pagina, linha_ocr, confianca, status
             FROM extracoes
-            WHERE arquivo_nome = ? AND data_processamento = ?
+            WHERE arquivo_nome = %s AND data_processamento = %s
             ORDER BY pagina, id
         """, (arquivo_nome, ultima_data))
         
         rows = cursor.fetchall()
         conn.close()
         
-        registros = []
-        for row in rows:
-            registros.append({
-                "id": row[0],
-                "campo": row[1],
-                "valor": row[2],
-                "data_extracao": row[3],
-                "pagina": row[4],
-                "linha_ocr": row[5],
-                "confianca": row[6],
-                "status": row[7]
-            })
-        
-        return registros
+        return rows
     
     def listar_todas_extracoes(self, limite: int = 100) -> List[Dict[str, Any]]:
         """Lista todas as extrações do banco"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -227,58 +253,56 @@ class ExtractionDatabase:
                    data_extracao, pagina, linha_ocr, confianca, status
             FROM extracoes
             ORDER BY created_at DESC
-            LIMIT ?
+            LIMIT %s
         """, (limite,))
         
         rows = cursor.fetchall()
         conn.close()
         
-        registros = []
-        for row in rows:
-            registros.append({
-                "id": row[0],
-                "arquivo_nome": row[1],
-                "data_processamento": row[2],
-                "campo": row[3],
-                "valor": row[4],
-                "data_extracao": row[5],
-                "pagina": row[6],
-                "linha_ocr": row[7],
-                "confianca": row[8],
-                "status": row[9]
-            })
-        
-        return registros
+        return rows
     
     def estatisticas(self) -> Dict[str, Any]:
-        """Retorna estatísticas do banco"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Total de registros
-        cursor.execute("SELECT COUNT(*) FROM extracoes")
-        total_registros = cursor.fetchone()[0]
-        
-        # Total de arquivos processados
-        cursor.execute("SELECT COUNT(DISTINCT arquivo_nome) FROM extracoes")
-        total_arquivos = cursor.fetchone()[0]
-        
-        # Distribuição por campo
-        cursor.execute("""
-            SELECT campo, COUNT(*) as count
-            FROM extracoes
-            GROUP BY campo
-            ORDER BY count DESC
-        """)
-        distribuicao_campos = {row[0]: row[1] for row in cursor.fetchall()}
-        
-        conn.close()
-        
-        return {
-            "total_registros": total_registros,
-            "total_arquivos": total_arquivos,
-            "distribuicao_campos": distribuicao_campos
-        }
+        """Retorna estatísticas do banco com tratamento de erro"""
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            # Total de Resumos Mensais (Nova Tabela)
+            cursor.execute("SELECT COUNT(*) as count FROM resumos_mensais")
+            resumos = cursor.fetchone()['count'] if cursor.rowcount > 0 else 0
+            
+            # Total de Lançamentos CC (Nova Tabela)
+            cursor.execute("SELECT COUNT(*) as count FROM movimentacoes_cc")
+            ccs = cursor.fetchone()['count'] if cursor.rowcount > 0 else 0
+            
+            # Total de Arquivos Únicos
+            cursor.execute("""
+                SELECT COUNT(DISTINCT arquivo_nome) as count 
+                FROM (
+                    SELECT arquivo_nome FROM resumos_mensais
+                    UNION
+                    SELECT arquivo_nome FROM movimentacoes_cc
+                ) as arquivos
+            """)
+            result_arquivos = cursor.fetchone()
+            total_arquivos = result_arquivos['count'] if result_arquivos else 0
+            
+            conn.close()
+            
+            return {
+                "total_registros": resumos + ccs,
+                "total_arquivos": total_arquivos,
+                "resumos": resumos,
+                "ccs": ccs,
+                "distribuicao_campos": {} # Opcional agora
+            }
+        except Exception as e:
+            logger.error(f"Erro ao buscar estatísticas: {e}")
+            return {
+                "total_registros": 0,
+                "total_arquivos": 0,
+                "distribuicao_campos": {}
+            }
     
     def salvar_resumos_mensais(
         self,
@@ -287,22 +311,15 @@ class ExtractionDatabase:
     ) -> int:
         """
         Salva resumos mensais no banco
-        
-        Args:
-            arquivo_nome: Nome do arquivo processado
-            resumos: Dict[pagina, resumo_data]
-        
-        Returns:
-            Número de resumos salvos
         """
         data_processamento = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         total_salvos = 0
         
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         
         # REMOVE resumos antigos deste arquivo (evita duplicatas)
-        cursor.execute("DELETE FROM resumos_mensais WHERE arquivo_nome = ?", (arquivo_nome,))
+        cursor.execute("DELETE FROM resumos_mensais WHERE arquivo_nome = %s", (arquivo_nome,))
         linhas_removidas = cursor.rowcount
         if linhas_removidas > 0:
             logger.info(f"Removidos {linhas_removidas} resumos antigos de {arquivo_nome}")
@@ -315,7 +332,7 @@ class ExtractionDatabase:
                 (arquivo_nome, data_processamento, pagina,
                  saldo_anterior, aplicacoes, resgates, rendimento_bruto,
                  imposto_renda, iof, rendimento_liquido, saldo_atual)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 arquivo_nome,
                 data_processamento,
@@ -331,7 +348,6 @@ class ExtractionDatabase:
             ))
             total_salvos += 1
         
-        conn.commit()
         conn.close()
         
         logger.info(f"Salvos {total_salvos} resumos mensais no banco para {arquivo_nome}")
@@ -340,67 +356,71 @@ class ExtractionDatabase:
     def listar_resumos_mensais(self, arquivo_nome: str) -> Dict[int, Dict[str, Any]]:
         """
         Lista os resumos mensais da última extração de um arquivo
-        
-        Returns:
-            Dict[pagina, resumo_data]
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         
         # Busca a última data de processamento deste arquivo
         cursor.execute("""
             SELECT DISTINCT data_processamento 
             FROM resumos_mensais 
-            WHERE arquivo_nome = ?
+            WHERE arquivo_nome = %s
             ORDER BY data_processamento DESC
             LIMIT 1
         """, (arquivo_nome,))
         
         result = cursor.fetchone()
         if not result:
+            logger.warning(f"Nenhum resumo encontrado no banco para o arquivo: {arquivo_nome}")
             conn.close()
             return {}
         
-        ultima_data = result[0]
+        ultima_data = result['data_processamento']
+        logger.info(f"Buscando resumos para {arquivo_nome} da data {ultima_data}")
         
         # Busca todos os resumos desta extração
         cursor.execute("""
             SELECT pagina, saldo_anterior, aplicacoes, resgates, rendimento_bruto,
                    imposto_renda, iof, rendimento_liquido, saldo_atual
             FROM resumos_mensais
-            WHERE arquivo_nome = ? AND data_processamento = ?
+            WHERE arquivo_nome = %s AND data_processamento = %s
             ORDER BY pagina
         """, (arquivo_nome, ultima_data))
         
         rows = cursor.fetchall()
         conn.close()
         
+        def to_f(v):
+            if v is None: return None
+            try: return float(v)
+            except: return None
+
         resumos = {}
         for row in rows:
-            pagina = row[0]
-            resumos[pagina] = {
+            p = row['pagina']
+            resumos[p] = {
                 "tipo": "RESUMO_MENSAL",
-                "pagina": pagina,
+                "pagina": p,
                 "campos": {
-                    "saldo_anterior": row[1],
-                    "aplicacoes": row[2],
-                    "resgates": row[3],
-                    "rendimento_bruto": row[4],
-                    "imposto_renda": row[5],
-                    "iof": row[6],
-                    "rendimento_liquido": row[7],
-                    "saldo_atual": row[8]
+                    "saldo_anterior": to_f(row['saldo_anterior']),
+                    "aplicacoes": to_f(row['aplicacoes']),
+                    "resgates": to_f(row['resgates']),
+                    "rendimento_bruto": to_f(row['rendimento_bruto']),
+                    "imposto_renda": to_f(row['imposto_renda']),
+                    "iof": to_f(row['iof']),
+                    "rendimento_liquido": to_f(row['rendimento_liquido']),
+                    "saldo_atual": to_f(row['saldo_atual'])
                 }
             }
         
+        logger.info(f"Retornando {len(resumos)} resumos para o frontend.")
         return resumos
     
     def limpar_banco(self):
         """
         CUIDADO: Remove TODOS os dados do banco
-        Útil para testes ou reset completo
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         
         cursor.execute("DELETE FROM extracoes")
@@ -409,30 +429,34 @@ class ExtractionDatabase:
         cursor.execute("DELETE FROM resumos_mensais")
         resumos_removidos = cursor.rowcount
         
-        conn.commit()
+        cursor.execute("DELETE FROM movimentacoes_cc")
+        cc_removidas = cursor.rowcount
+        
         conn.close()
         
         logger.warning(f"BANCO LIMPO: {extracoes_removidas} extracoes + {resumos_removidos} resumos removidos")
-        return {"extracoes": extracoes_removidas, "resumos": resumos_removidos}
+        return {"extracoes": extracoes_removidas, "resumos": resumos_removidos, "cc": cc_removidas}
     
     def limpar_arquivo(self, arquivo_nome: str):
         """
         Remove apenas os dados de um arquivo específico
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         
-        cursor.execute("DELETE FROM extracoes WHERE arquivo_nome = ?", (arquivo_nome,))
+        cursor.execute("DELETE FROM extracoes WHERE arquivo_nome = %s", (arquivo_nome,))
         extracoes_removidas = cursor.rowcount
         
-        cursor.execute("DELETE FROM resumos_mensais WHERE arquivo_nome = ?", (arquivo_nome,))
+        cursor.execute("DELETE FROM resumos_mensais WHERE arquivo_nome = %s", (arquivo_nome,))
         resumos_removidos = cursor.rowcount
         
-        conn.commit()
+        cursor.execute("DELETE FROM movimentacoes_cc WHERE arquivo_nome = %s", (arquivo_nome,))
+        cc_removidos = cursor.rowcount
+        
         conn.close()
         
-        if extracoes_removidas > 0 or resumos_removidos > 0:
-            logger.info(f"Removidos dados antigos: {extracoes_removidas} extracoes + {resumos_removidos} resumos de '{arquivo_nome}'")
+        if extracoes_removidas > 0 or resumos_removidos > 0 or cc_removidos > 0:
+            logger.info(f"Removidos dados antigos para '{arquivo_nome}'")
     
     def salvar_resumo_individual(
         self,
@@ -443,15 +467,11 @@ class ExtractionDatabase:
     ) -> int:
         """
         Salva UM resumo mensal IMEDIATAMENTE no banco
-        (Gravação incremental página por página)
-        
-        Args:
-            data_processamento: Se fornecida, usa esta data (para manter consistência no lote)
         """
         if data_processamento is None:
             data_processamento = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -459,7 +479,7 @@ class ExtractionDatabase:
             (arquivo_nome, data_processamento, pagina,
              saldo_anterior, aplicacoes, resgates, rendimento_bruto,
              imposto_renda, iof, rendimento_liquido, saldo_atual)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             arquivo_nome,
             data_processamento,
@@ -475,8 +495,115 @@ class ExtractionDatabase:
         ))
         
         resumo_id = cursor.lastrowid
-        conn.commit()
         conn.close()
         
-        logger.debug(f"Resumo da pagina {pagina} gravado no banco (ID: {resumo_id})")
         return resumo_id
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # CONTA CORRENTE
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def salvar_movimentacao_cc(
+        self,
+        arquivo_nome: str,
+        data_processamento: str,
+        pagina: int,
+        header: Dict[str, str],
+        transacao: Dict[str, Any],
+    ) -> int:
+        """Salva uma única linha de lançamento de conta corrente."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO movimentacoes_cc
+            (arquivo_nome, data_processamento, pagina,
+             agencia, conta, titular, periodo,
+             data_balancete, data_movimento, historico,
+             valor, valor_tipo, saldo, saldo_tipo, documento, raw_line)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            arquivo_nome,
+            data_processamento,
+            pagina,
+            header.get("agencia", ""),
+            header.get("conta", ""),
+            header.get("titular", ""),
+            header.get("periodo", ""),
+            transacao.get("data_balancete", ""),
+            transacao.get("data_movimento", ""),
+            transacao.get("historico", ""),
+            transacao.get("valor"),
+            transacao.get("valor_tipo", "C"),
+            transacao.get("saldo"),
+            transacao.get("saldo_tipo", "C"),
+            transacao.get("documento", ""),
+            transacao.get("raw_line", ""),
+        ))
+        row_id = cursor.lastrowid
+        conn.close()
+        return row_id
+
+    def listar_movimentacoes_cc(self, arquivo_nome: str) -> List[Dict[str, Any]]:
+        """Retorna todas as movimentações CC de um arquivo, ordenadas por id."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM movimentacoes_cc
+            WHERE arquivo_nome = %s
+            ORDER BY pagina, id
+        """, (arquivo_nome,))
+        rows = cursor.fetchall()
+        conn.close()
+        
+        # Converte campos Decimal para float para evitar erro de serialização JSON
+        for row in rows:
+            if row.get('valor') is not None:
+                row['valor'] = float(row['valor'])
+            if row.get('saldo') is not None:
+                row['saldo'] = float(row['saldo'])
+                
+        return rows
+
+    def atualizar_campo_cc(self, row_id: int, campo: str, novo_valor: Any) -> bool:
+        """Atualiza um campo editável de uma linha CC e marca como editado manualmente."""
+        CAMPOS_EDITAVEIS = {
+            "data_balancete", "data_movimento", "historico",
+            "valor", "saldo", "valor_tipo", "saldo_tipo",
+        }
+        if campo not in CAMPOS_EDITAVEIS:
+            return False
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            f"UPDATE movimentacoes_cc SET {campo} = %s, editado_manualmente = 1 WHERE id = %s",
+            (novo_valor, row_id),
+        )
+        atualizado = cursor.rowcount > 0
+        conn.close()
+        return atualizado
+
+    def atualizar_campo_resumo(self, arquivo_nome: str, pagina: int, campo: str, novo_valor: float) -> bool:
+        """Atualiza um campo numérico de um resumo mensal (edição manual)."""
+        CAMPOS_EDITAVEIS = {
+            "saldo_anterior", "aplicacoes", "resgates",
+            "rendimento_bruto", "imposto_renda", "iof",
+            "rendimento_liquido", "saldo_atual",
+        }
+        if campo not in CAMPOS_EDITAVEIS:
+            return False
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            f"UPDATE resumos_mensais SET {campo} = %s WHERE arquivo_nome = %s AND pagina = %s",
+            (novo_valor, arquivo_nome, pagina),
+        )
+        atualizado = cursor.rowcount > 0
+        conn.close()
+        return atualizado
+
+    def limpar_cc_arquivo(self, arquivo_nome: str):
+        """Remove todas as movimentações CC de um arquivo antes de reprocessar."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM movimentacoes_cc WHERE arquivo_nome = %s", (arquivo_nome,))
+        conn.close()

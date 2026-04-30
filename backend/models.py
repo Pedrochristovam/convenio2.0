@@ -13,7 +13,6 @@ class ExtractionResult(BaseModel):
 
 class DocumentResponse(BaseModel):
     resultados_por_pagina: Dict[int, List[ExtractionResult]]
-    resumos_mensais: Optional[Dict[int, Dict[str, Any]]] = {}  # Novo campo
-    ocr_bruto: str  # Pode ser truncado para grandes volumes
-
-
+    resumos_mensais: Optional[Dict[int, Dict[str, Any]]] = {}
+    movimentacoes_cc: Optional[List[Dict[str, Any]]] = []  # Novo: transações CC
+    ocr_bruto: str

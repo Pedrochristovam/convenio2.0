@@ -3,10 +3,14 @@ from backend.extraction_service import ExtractionCoordinator
 from backend.models import DocumentResponse
 from backend.database import ExtractionDatabase
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from backend.calculation_service import calculator
+from backend.export_service import export_service
 
 import logging
 import asyncio
 import json
+from datetime import datetime
 
 app = FastAPI(title="Convenio Extração API")
 
@@ -20,13 +24,11 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
-
 coordinator = ExtractionCoordinator()
 db = ExtractionDatabase()
 
 # Gerenciador de conexões WebSocket ativas
 active_websockets = set()
-
 
 # Configuração de log para auditoria
 logging.basicConfig(level=logging.INFO)
@@ -102,8 +104,7 @@ async def extract_data(file: UploadFile = File(...)):
         logger.info(f"Arquivo validado: {file.filename} ({len(file_content)} bytes)")
         logger.info(f"Iniciando processamento OCR...")
 
-        
-        # Coordena extração e parsing (AGORA COM BANCO DE DADOS E PROGRESSO)
+        # Coordena extração e parsing
         response = await coordinator.process_document_staged(
             file_content, 
             arquivo_nome=file.filename,
@@ -169,7 +170,6 @@ async def estatisticas():
 async def limpar_banco():
     """
     CUIDADO: Remove TODOS os dados do banco
-    Use apenas para testes ou reset completo
     """
     try:
         resultado = db.limpar_banco()
@@ -214,11 +214,100 @@ async def debug_ocr_page(page_num: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/movimentacoes-cc/{arquivo_nome}")
+async def listar_movimentacoes_cc(arquivo_nome: str):
+    """Retorna todas as movimentações de conta corrente de um arquivo."""
+    try:
+        registros = db.listar_movimentacoes_cc(arquivo_nome)
+        return {"arquivo": arquivo_nome, "total": len(registros), "movimentacoes": registros}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/movimentacao-cc/{row_id}")
+async def atualizar_movimentacao_cc(row_id: int, payload: dict):
+    """
+    Atualiza um campo de uma movimentação CC.
+    """
+    campo = payload.get("campo")
+    valor = payload.get("valor")
+    if not campo or valor is None:
+        raise HTTPException(status_code=400, detail="Informe 'campo' e 'valor' no body.")
+    ok = db.atualizar_campo_cc(row_id, campo, valor)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Linha {row_id} não encontrada ou campo inválido.")
+    return {"success": True, "id": row_id, "campo": campo, "novo_valor": valor}
+
+
+@app.patch("/resumo-mensal/{arquivo_nome}/{pagina}")
+async def atualizar_resumo_mensal(arquivo_nome: str, pagina: int, payload: dict):
+    """
+    Atualiza um campo numérico de um resumo mensal.
+    """
+    campo = payload.get("campo")
+    valor = payload.get("valor")
+    if not campo or valor is None:
+        raise HTTPException(status_code=400, detail="Informe 'campo' e 'valor' no body.")
+    try:
+        valor_float = float(valor)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="O campo 'valor' deve ser numérico.")
+    ok = db.atualizar_campo_resumo(arquivo_nome, pagina, campo, valor_float)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Resumo (pág. {pagina}) não encontrado ou campo inválido.")
+    return {"success": True, "arquivo": arquivo_nome, "pagina": pagina, "campo": campo, "novo_valor": valor_float}
+
+
+@app.post("/calculate")
+async def calculate_indices(payload: dict):
+    """
+    Calculates index correction using BCB API.
+    """
+    value = payload.get("value", 0.0)
+    start_date = payload.get("start_date")
+    end_date = payload.get("end_date") or datetime.now().strftime("%d/%m/%Y")
+    method = payload.get("method", "cdi")
+    
+    if not start_date:
+        return {"original_value": value, "corrected_value": value, "factor": 1.0, "method": method}
+        
+    result = calculator.calculate_correction(value, start_date, end_date, method)
+    return result
+
+@app.post("/export/pdf")
+async def export_pdf(payload: dict):
+    """
+    Generates and returns a PDF report.
+    """
+    try:
+        pdf_buffer = export_service.generate_pdf(payload)
+        return StreamingResponse(
+            pdf_buffer, 
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename=Parecer_Auditoria_{datetime.now().strftime('%Y%m%d')}.pdf"}
+        )
+    except Exception as e:
+        logger.error(f"Error generating PDF: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/export/excel")
+async def export_excel(payload: dict):
+    """
+    Generates and returns an Excel report.
+    """
+    try:
+        excel_buffer = export_service.generate_excel(payload)
+        return StreamingResponse(
+            excel_buffer, 
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename=Dados_Auditoria_{datetime.now().strftime('%Y%m%d')}.xlsx"}
+        )
+    except Exception as e:
+        logger.error(f"Error generating Excel: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=5050, log_level="debug")
-
-
-
-
-
+    logger.info("Iniciando Convenio 2.0 Backend na porta 5053...")
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=5053, reload=True)

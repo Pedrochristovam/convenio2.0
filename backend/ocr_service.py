@@ -74,7 +74,8 @@ class GoogleVisionOCR:
                                 })
                             
                             page = doc.load_page(page_num)
-                            pix = page.get_pixmap(matrix=fitz.Matrix(3, 3))
+                            # Matrix(2,2) é mais que suficiente para o Google Vision e economiza MUITA memória em arquivos grandes
+                            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
                             img_bytes = pix.tobytes("png")
                             
                             # SEM PRÉ-PROCESSAMENTO (Google Vision funciona melhor com imagem original)

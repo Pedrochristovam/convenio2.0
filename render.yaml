@@ -1,0 +1,35 @@
+services:
+  # ----------------------------------------------------
+  # 1. SERVIDOR PYTHON (Backend FastAPI)
+  # ----------------------------------------------------
+  - type: web
+    name: convenio2-backend
+    env: python
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+        
+      # (Opcional) Quaisquer senhas que você tem no .env
+      # devem ser adicionadas pelo painel do Render depois (ex: GROQ_API_KEY)
+
+  # ----------------------------------------------------
+  # 2. SITE ESTÁTICO (Frontend React/Vite)
+  # ----------------------------------------------------
+  - type: web
+    name: convenio2-frontend
+    env: static
+    buildCommand: npm install && npm run build
+    staticPublishPath: ./dist
+    envVars:
+      - key: NODE_VERSION
+        value: 20.0.0
+      
+      # Esta variável vai passar a URL pública do Backend gerada pelo Render
+      # direto para o build do frontend, de forma automática!
+      - key: VITE_BACKEND_URL
+        fromService:
+          type: web
+          name: convenio2-backend
+          envVarKey: RENDER_EXTERNAL_URL

@@ -14,230 +14,167 @@ class MonthlySummaryParser:
     """
     
     def __init__(self):
-        # Ordem EXATA dos campos no documento
         self.campos_ordem = [
-            "saldo_anterior",
-            "aplicacoes",
-            "resgates",
-            "rendimento_bruto",
-            "imposto_renda",
-            "iof",
-            "rendimento_liquido",
-            "saldo_atual"
+            "saldo_anterior", "aplicacoes", "resgates", 
+            "rendimento_bruto", "imposto_renda", "iof", 
+            "rendimento_liquido", "saldo_atual"
         ]
-        
-        # Padrão simples: qualquer número brasileiro (com . ou espaço como separador e , decimal)
-        self.valor_pattern = re.compile(r'(\d{1,3}(?:[\.\s]\d{3})*,\d{2})')
-    
+        # Regex para valores monetários (2 ou 3 casas decimais devido a ruído OCR)
+        # Ex: "157,847" ou "157,84"
+        self.valor_pattern = re.compile(
+            r'(\d{1,3}(?:[ \t\.]+\d{3})*,\d{2,3})(?!\d)|'
+            r'(\d{1,3}(?:[ \t\.]+\d{3})*[ \t\.]\d{2,3})(?!\d)'
+        )
+
     def clean_value(self, value_str: str) -> Optional[float]:
+        if not value_str: return None
+        try:
+            # Especial para BB: as vezes o OCR reconhece "1 354 86" (sem vírgula)
+            val = value_str.replace('.', '').replace(' ', '')
+            
+            # Se tiver vírgula, trata como decimal
+            if ',' in val:
+                parts = val.split(',')
+                # Se tiver 3 dígitos após a vírgula (ruído), remove o último
+                if len(parts[1]) > 2:
+                    parts[1] = parts[1][:2]
+                val = parts[0] + "." + parts[1]
+            else:
+                # Trata os últimos 2 dígitos como decimais se não houver vírgula
+                if len(val) >= 3:
+                    # Se tiver 3 dígitos de sobra (ex: 157847), o padrão acima já tentou pegar apenas os úteis.
+                    # Mas por segurança, se for muito longo, pegamos os 2 últimos.
+                    val = val[:-2] + "." + val[-2:]
+            
+            return float(val)
+        except:
+            return None
+
+    def is_math_valid(self, campos: Dict[str, Any]) -> bool:
         """
-        Converte string para float
-        
-        "169 731,94" → 169731.94
-        "105.000,00" → 105000.00
-        "0,00" → 0.0
+        Garante que a conta fecha e que pelo menos um valor é relevante.
         """
         try:
-            cleaned = value_str.strip().replace(" ", "").replace(".", "").replace(",", ".")
-            valor = float(cleaned)
-            return valor
-        except (ValueError, AttributeError):
-            logger.warning(f"Nao foi possivel converter valor: '{value_str}'")
-            return None
-    
-    def extract_resumo_section(self, page_text: str) -> Optional[str]:
-        """
-        Extrai apenas o bloco de texto da seção "Resumo do mês"
-        """
-        match_inicio = re.search(r"RESUMO\s+DO\s+M[EÊ]S", page_text, re.IGNORECASE)
-        if not match_inicio:
-            return None
-        
-        texto_pos_resumo = page_text[match_inicio.start():]
-        
-        # Encontra o fim da seção
-        fim_patterns = [
-            r"\n\s*Valor\s+da\s+Cota",  # Linha após "SALDO ATUAL"
-            r"\n\s*Rentabilidade",
-            r"\n\s*Data\s+Hist[oó]rico",
-            r"\n\s*\d{2}/\d{2}/\d{4}\s+[A-Z]"
-        ]
-        
-        fim_pos = len(texto_pos_resumo)
-        for pattern in fim_patterns:
-            match_fim = re.search(pattern, texto_pos_resumo, re.IGNORECASE)
-            if match_fim and match_fim.start() > 100:
-                fim_pos = min(fim_pos, match_fim.start())
-        
-        bloco_resumo = texto_pos_resumo[:fim_pos]
-        logger.info(f"Bloco de Resumo extraido ({len(bloco_resumo)} caracteres)")
-        return bloco_resumo
-    
-    def parse_resumo_simples(self, bloco_resumo: str) -> Dict[str, Optional[float]]:
-        """
-        Parser para LAYOUT DE 2 COLUNAS:
-        
-        COLUNA ESQUERDA:              COLUNA DIREITA:
-        SALDO ANTERIOR                APLICAÇÕES (+)
-        60.820,83                     0,00
-        
-        RESGATES (-)                  RENDIMENTO BRUTO (+)
-        0,00                          469,18
-        
-        IMPOSTO DE RENDA (-)          IOF (-)
-        0,00                          0,00
-        
-        RENDIMENTO LÍQUIDO            SALDO ATUAL =
-        469,18                        61.290,01
-        
-        ESTRATÉGIA:
-        1. Divide o bloco em linhas
-        2. Encontra a linha com o TERMO
-        3. Pega o valor da PRÓXIMA linha (abaixo), NA MESMA POSIÇÃO horizontal
-        """
-        
-        linhas = bloco_resumo.split('\n')
-        
-        # Dicionário de termos para buscar
-        termos_busca = {
-            "saldo_anterior": ["SALDO ANTERIOR"],
-            "aplicacoes": ["APLICAÇÕES (+)", "APLICACOES (+)", "APLICAÇÕES", "APLICACOES"],
-            "resgates": ["RESGATES (-)"],
-            "rendimento_bruto": ["RENDIMENTO BRUTO (+)"],
-            "imposto_renda": ["IMPOSTO DE RENDA (-)", "IMPOSTO RENDA (-)"],
-            "iof": ["IOF (-)"],
-            "rendimento_liquido": ["RENDIMENTO LÍQUIDO", "RENDIMENTO LIQUIDO"],
-            "saldo_atual": ["SALDO ATUAL =", "SALDO ATUAL"]
-        }
-        
-        resultado = {}
-        
-        for campo in self.campos_ordem:
-            termos = termos_busca[campo]
-            valor_encontrado = None
+            vals = {k: (campos.get(k) or 0.0) for k in self.campos_ordem}
             
-            # Procura o termo nas linhas
-            for i, linha in enumerate(linhas):
-                linha_upper = linha.upper()
-                
-                termo_encontrado = None
-                posicao_termo = -1
-                
-                for termo in termos:
-                    if termo in linha_upper:
-                        termo_encontrado = termo
-                        posicao_termo = linha_upper.index(termo)
-                        break
-                
-                if termo_encontrado:
-                    logger.debug(f"Campo '{campo}': termo '{termo_encontrado}' encontrado na linha {i}, posição {posicao_termo}")
-                    
-                    # ESTRATÉGIA: Valor está na PRÓXIMA linha (ou até 3 linhas abaixo)
-                    # Na mesma região horizontal (±20 caracteres da posição do termo)
-                    
-                    for offset in range(1, 4):  # Tenta próximas 3 linhas
-                        if i + offset >= len(linhas):
-                            break
-                        
-                        linha_valor = linhas[i + offset]
-                        
-                        # Busca valores nesta linha
-                        valores = self.valor_pattern.findall(linha_valor)
-                        
-                        if not valores:
-                            continue
-                        
-                        # Se há apenas 1 valor na linha, usa ele
-                        if len(valores) == 1:
-                            valor_encontrado = self.clean_value(valores[0])
-                            logger.info(f"  {campo}: {valor_encontrado} (1 valor na linha {i+offset})")
-                            break
-                        
-                        # Se há múltiplos valores, pega o que está mais próximo horizontalmente do termo
-                        melhor_valor = None
-                        menor_distancia = float('inf')
-                        
-                        for valor_str in valores:
-                            pos_valor = linha_valor.index(valor_str)
-                            distancia = abs(pos_valor - posicao_termo)
-                            
-                            if distancia < menor_distancia:
-                                menor_distancia = distancia
-                                melhor_valor = valor_str
-                        
-                        if melhor_valor and menor_distancia < 50:  # Aceita até 50 caracteres de distância
-                            valor_encontrado = self.clean_value(melhor_valor)
-                            logger.info(f"  {campo}: {valor_encontrado} (valor mais próximo na linha {i+offset}, distância {menor_distancia})")
-                            break
-                    
-                    if valor_encontrado:
-                        break
+            # Requisito: Não pode ser tudo zero (evita falsos positivos em listas de transação)
+            if all(abs(v) < 0.01 for v in vals.values()):
+                return False
+
+            # Conferência principal: sa + ap - re + rl = st
+            calc_total = vals["saldo_anterior"] + vals["aplicacoes"] - vals["resgates"] + vals["rendimento_liquido"]
+            diff_total = abs(calc_total - vals["saldo_atual"])
             
-            resultado[campo] = valor_encontrado
+            # Conferência secundária: rl = bruto - ir - iof
+            calc_rl = vals["rendimento_bruto"] - vals["imposto_renda"] - vals["iof"]
+            diff_rl = abs(calc_rl - vals["rendimento_liquido"])
             
-            if valor_encontrado is None:
-                logger.warning(f"  {campo}: NAO ENCONTRADO")
-        
-        # Log de auditoria
-        campos_encontrados = sum(1 for v in resultado.values() if v is not None)
-        logger.info(f"Resumo extraído: {campos_encontrados}/8 campos encontrados")
-        
-        return resultado
-    
+            debug_info = f"CalcTotal: {calc_total:.2f} vs ST: {vals['saldo_atual']:.2f} (Diff: {diff_total:.2f}) | CalcRL: {calc_rl:.2f} vs RL: {vals['rendimento_liquido']:.2f} (Diff: {diff_rl:.2f})"
+            
+            # Permitimos margem de 0.10
+            is_valid = diff_total < 0.10 and diff_rl < 0.10
+            return is_valid, debug_info
+        except:
+            return False, "Erro no cálculo"
+
     def parse_resumo(self, page_text: str, page_num: int) -> Optional[Dict[str, Any]]:
         """
-        Extrai campos do "Resumo do mês"
+        Extrai o resumo mensal buscando qualquer sequência de 8 números que feche a conta.
+        Ignora labels corrompidas e foca na verificação matemática.
         """
-        if not re.search(r"RESUMO\s+DO\s+M[EÊ]S", page_text, re.IGNORECASE):
+        # 1. Limpeza agressiva de OCR (Remove caracteres que quebram números)
+        # Mantém apenas números, vírgulas, pontos e espaços
+        clean_text = page_text.replace('|', ' ').replace(']', ' ').replace('[', ' ')
+        
+        # 2. Extrai TODOS os valores monetários da página
+        all_vals = []
+        for m in self.valor_pattern.finditer(clean_text):
+            val_str = m.group(0)
+            val = self.clean_value(val_str)
+            if val is not None:
+                # Filtra anos (2010-2030) se não tiverem vírgula
+                if 2010 <= val <= 2030 and "," not in val_str:
+                    continue
+                all_vals.append({"val": val, "pos": m.start(), "raw": val_str})
+        
+        if len(all_vals) < 8:
+            logger.debug(f"Pagina {page_num}: Apenas {len(all_vals)} valores encontrados. Ignorando.")
             return None
+
+        # 3. VERIFICAÇÃO DE CONTEXTO: Deve haver palavras-chave de extrato na página
+        # Normalização básica para evitar erros de encoding no OCR (MÃŠS -> MES)
+        page_upper = page_text.upper().replace('ÃŠ', 'E').replace('Ã', 'A')
         
-        bloco_resumo = self.extract_resumo_section(page_text)
-        if not bloco_resumo:
-            logger.warning(f"Pagina {page_num}: 'Resumo do Mes' detectado mas bloco nao extraido")
+        # Requisito 1: "RESUMO DO MÊS" (OU "RESUMO DO")
+        has_resumo_header = "RESUMO DO" in page_upper
+        
+        # Requisito 2: Combinação de Saldo + Rendimento (Partial match para "SALDO ANTERIO")
+        has_bank_context = ("SALDO ANTERIO" in page_upper) and (("RENDIMENTO" in page_upper) or ("RESUMO" in page_upper))
+        
+        if not (has_resumo_header or has_bank_context):
+            logger.debug(f"Página {page_num}: Contexto bancário não identificado. Ignorando.")
             return None
-        
-        logger.info(f"Pagina {page_num}: Processando Resumo do Mes")
-        
-        # Parser SIMPLES linha por linha
-        campos_extraidos = self.parse_resumo_simples(bloco_resumo)
-        
-        # Conta quantos campos foram encontrados
-        campos_encontrados = sum(1 for v in campos_extraidos.values() if v is not None)
-        logger.info(f"Resumo do Mes extraido: {campos_encontrados}/8 campos encontrados")
-        
-        resultado = {
-            "tipo": "RESUMO_MENSAL",
-            "pagina": page_num,
-            "campos": campos_extraidos
-        }
-        
-        return resultado
-    
-    def parse_all_pages(self, pages_texts: list) -> Dict[int, Dict[str, Any]]:
-        """
-        Processa múltiplas páginas e retorna resumos encontrados
-        """
-        resumos = {}
-        paginas_sem_resumo = []
-        
-        for idx, page_text in enumerate(pages_texts):
-            page_num = idx + 1
+
+        # 4. ESTRATÉGIA: Sliding Window Global
+        # Testa TODAS as sequências de 8 números na página
+        best_candidate = None
+        best_diff = 999999.0
+
+        for i in range(len(all_vals) - 7):
+            window = all_vals[i:i+8]
             
-            if not re.search(r"RESUMO\s+DO\s+M[EÊ]S", page_text, re.IGNORECASE):
-                paginas_sem_resumo.append(page_num)
+            # Verificação de PROXIMIDADE: Os valores devem estar próximos no texto
+            # Se a distância entre o primeiro e o último for muito grande, é provavelmente erro.
+            distancia = window[-1]["pos"] - window[0]["pos"]
+            if distancia > 1500: # 1500 caracteres é uma distância segura para uma tabela
                 continue
+
+            test_results = {self.campos_ordem[j]: window[j]["val"] for j in range(8)}
             
-            resumo = self.parse_resumo(page_text, page_num)
+            math_ok, math_debug = self.is_math_valid(test_results)
             
-            if resumo:
-                resumos[page_num] = resumo
+            # Se bater perfeito, retornamos imediatamente (GOL!)
+            if math_ok:
+                logger.info(f"Pagina {page_num}: GOL! Janela Matemática Global encontrada (indices {i}-{i+7}, dist: {distancia}).")
+                return {
+                    "tipo": "RESUMO_MENSAL", 
+                    "pagina": page_num, 
+                    "campos": test_results, 
+                    "math_error": False,
+                    "math_debug": math_debug
+                }
+            
+            # Guarda o "quase-acerto" para logs se nada for encontrado
+            try:
+                vals = [window[j]["val"] for j in range(8)]
+                current_diff = abs((vals[0] + vals[1] - vals[2] + vals[6]) - vals[7])
+                if current_diff < best_diff:
+                    best_diff = current_diff
+                    best_candidate = test_results
+            except:
+                pass
+
+        # 4. Fallback: Se não achou janela perfeita, procura por proximidade de labels
+        # (Legado para segurança, mas a janela global deve resolver 99% dos casos do BB)
+        logger.warning(f"Pagina {page_num}: Nenhuma janela matemática perfeita encontrada (Best Diff: {best_diff:.2f}).")
         
-        if resumos:
-            logger.info("=" * 60)
-            logger.info(f"RELATORIO DE RESUMOS MENSAIS:")
-            logger.info(f"  Total de paginas processadas: {len(pages_texts)}")
-            logger.info(f"  Paginas com resumo mensal: {len(resumos)} {list(resumos.keys())[:10]}{'...' if len(resumos) > 10 else ''}")
-            logger.info(f"  Paginas sem resumo mensal: {len(paginas_sem_resumo)}")
-            logger.info("=" * 60)
-        
+        # Se chegamos aqui e o melhor candidato é "quase bom" (erro < 1.00), podemos reportar com erro
+        if best_candidate and best_diff < 10.0:
+            return {
+                "tipo": "RESUMO_MENSAL",
+                "pagina": page_num,
+                "campos": best_candidate,
+                "math_error": True,
+                "math_debug": f"Janela imperfeita (Diff: {best_diff:.2f})"
+            }
+
+        return None
+
+    def parse_all_pages(self, pages_texts: list) -> Dict[int, Dict[str, Any]]:
+        resumos = {}
+        for i, text in enumerate(pages_texts):
+            res = self.parse_resumo(text, i + 1)
+            # Apenas salva se não for tudo zero ou se a matemática bater
+            if res and any(v != 0 for v in res["campos"].values()):
+                resumos[i + 1] = res
         return resumos
