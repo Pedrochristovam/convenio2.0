@@ -39,20 +39,24 @@ class ExtractionDatabase:
         self._init_database()
     
     def _get_connection(self):
-        return pymysql.connect(
-            host=self.host,
-            user=self.user,
-            password=self.password,
-            database=self.database,
-            port=self.port,
-            cursorclass=pymysql.cursors.DictCursor,
-            autocommit=True
-        )
+        try:
+            return pymysql.connect(
+                host=self.host,
+                user=self.user,
+                password=self.password,
+                database=self.database,
+                port=self.port,
+                cursorclass=pymysql.cursors.DictCursor,
+                autocommit=True
+            )
+        except Exception as e:
+            return None
     
     def _init_database(self):
         """Inicializa as tabelas se não existirem (no MySQL)"""
         try:
             conn = self._get_connection()
+            if not conn: return 0
             cursor = conn.cursor()
             
             # Tabela principal de extrações
@@ -143,6 +147,7 @@ class ExtractionDatabase:
     ) -> int:
         """Salva uma extração no banco"""
         conn = self._get_connection()
+        if not conn: return 0
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -180,6 +185,7 @@ class ExtractionDatabase:
         total_salvos = 0
         
         conn = self._get_connection()
+        if not conn: return 0
         cursor = conn.cursor()
         
         # REMOVE extrações antigas deste arquivo (evita duplicatas)
@@ -216,6 +222,7 @@ class ExtractionDatabase:
     def listar_ultima_extracao(self, arquivo_nome: str) -> List[Dict[str, Any]]:
         """Lista a última extração de um arquivo específico"""
         conn = self._get_connection()
+        if not conn: return []
         cursor = conn.cursor()
         
         # Busca a última data de processamento deste arquivo
@@ -250,6 +257,7 @@ class ExtractionDatabase:
     def listar_todas_extracoes(self, limite: int = 100) -> List[Dict[str, Any]]:
         """Lista todas as extrações do banco"""
         conn = self._get_connection()
+        if not conn: return []
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -269,6 +277,7 @@ class ExtractionDatabase:
         """Retorna estatísticas do banco com tratamento de erro"""
         try:
             conn = self._get_connection()
+            if not conn: return {}
             cursor = conn.cursor()
             
             # Total de Resumos Mensais (Nova Tabela)
@@ -320,6 +329,7 @@ class ExtractionDatabase:
         total_salvos = 0
         
         conn = self._get_connection()
+        if not conn: return 0
         cursor = conn.cursor()
         
         # REMOVE resumos antigos deste arquivo (evita duplicatas)
@@ -362,6 +372,7 @@ class ExtractionDatabase:
         Lista os resumos mensais da última extração de um arquivo
         """
         conn = self._get_connection()
+        if not conn: return {}
         cursor = conn.cursor()
         
         # Busca a última data de processamento deste arquivo
@@ -425,6 +436,7 @@ class ExtractionDatabase:
         CUIDADO: Remove TODOS os dados do banco
         """
         conn = self._get_connection()
+        if not conn: return 0
         cursor = conn.cursor()
         
         cursor.execute("DELETE FROM extracoes")
@@ -446,6 +458,7 @@ class ExtractionDatabase:
         Remove apenas os dados de um arquivo específico
         """
         conn = self._get_connection()
+        if not conn: return 0
         cursor = conn.cursor()
         
         cursor.execute("DELETE FROM extracoes WHERE arquivo_nome = %s", (arquivo_nome,))
@@ -476,6 +489,7 @@ class ExtractionDatabase:
             data_processamento = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         conn = self._get_connection()
+        if not conn: return 0
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -517,6 +531,7 @@ class ExtractionDatabase:
     ) -> int:
         """Salva uma única linha de lançamento de conta corrente."""
         conn = self._get_connection()
+        if not conn: return 0
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO movimentacoes_cc
@@ -550,6 +565,7 @@ class ExtractionDatabase:
     def listar_movimentacoes_cc(self, arquivo_nome: str) -> List[Dict[str, Any]]:
         """Retorna todas as movimentações CC de um arquivo, ordenadas por id."""
         conn = self._get_connection()
+        if not conn: return []
         cursor = conn.cursor()
         cursor.execute("""
             SELECT * FROM movimentacoes_cc
@@ -577,6 +593,7 @@ class ExtractionDatabase:
         if campo not in CAMPOS_EDITAVEIS:
             return False
         conn = self._get_connection()
+        if not conn: return False
         cursor = conn.cursor()
         cursor.execute(
             f"UPDATE movimentacoes_cc SET {campo} = %s, editado_manualmente = 1 WHERE id = %s",
@@ -596,6 +613,7 @@ class ExtractionDatabase:
         if campo not in CAMPOS_EDITAVEIS:
             return False
         conn = self._get_connection()
+        if not conn: return False
         cursor = conn.cursor()
         cursor.execute(
             f"UPDATE resumos_mensais SET {campo} = %s WHERE arquivo_nome = %s AND pagina = %s",
@@ -608,6 +626,7 @@ class ExtractionDatabase:
     def limpar_cc_arquivo(self, arquivo_nome: str):
         """Remove todas as movimentações CC de um arquivo antes de reprocessar."""
         conn = self._get_connection()
+        if not conn: return 0
         cursor = conn.cursor()
         cursor.execute("DELETE FROM movimentacoes_cc WHERE arquivo_nome = %s", (arquivo_nome,))
         conn.close()
