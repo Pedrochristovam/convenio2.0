@@ -13,3 +13,6 @@ groq
 google-generativeai
 websockets
 pymysql
+pandas
+openpyxl
+reportlab
