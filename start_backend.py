@@ -7,8 +7,9 @@ sys.path.append(os.getcwd())
 
 try:
     from backend.main import app
-    print("App importado com sucesso. Iniciando servidor na porta 5053...", flush=True)
-    uvicorn.run(app, host="127.0.0.1", port=5053, log_level="debug")
+    port = int(os.environ.get("PORT", 5053))
+    print(f"App importado com sucesso. Iniciando servidor em 0.0.0.0:{port}...", flush=True)
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="debug")
 except Exception as e:
     import traceback
     print("ERRO CRITICAL NA INICIALIZACAO:")
