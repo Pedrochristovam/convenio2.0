@@ -28,7 +28,11 @@ class ExtractionDatabase:
     
     def __init__(self):
         self.host = os.getenv("MYSQL_HOST", "localhost")
-        self.port = int(os.getenv("MYSQL_PORT", 3306))
+        try:
+            port_str = os.getenv("MYSQL_PORT", "3306").strip()
+            self.port = int(port_str) if port_str else 3306
+        except Exception:
+            self.port = 3306
         self.user = os.getenv("MYSQL_USER", "root")
         self.password = os.getenv("MYSQL_PASSWORD", "")
         self.database = os.getenv("MYSQL_DATABASE", "convenio2")
