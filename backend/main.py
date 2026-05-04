@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks
 from backend.extraction_service import ExtractionCoordinator
 from backend.models import DocumentResponse
 from backend.database import ExtractionDatabase
@@ -65,10 +65,23 @@ async def websocket_progress(websocket: WebSocket):
 
 async def broadcast_progress(message: dict):
     """Envia mensagem de progresso para todos os clientes conectados"""
+    # Se a mensagem for o resultado final, embrulha no tipo correspondente
+    if "resumos_mensais" in message or "movimentacoes_cc" in message:
+        payload = {
+            "type": "FINAL_RESULT",
+            "data": message,
+            "message": "✓ Processamento concluído!",
+            "progress": 100
+        }
+    else:
+        payload = message
+        if "type" not in payload:
+            payload["type"] = "PROGRESS"
+
     disconnected = set()
     for websocket in active_websockets:
         try:
-            await websocket.send_json(message)
+            await websocket.send_json(payload)
         except Exception as e:
             logger.warning(f"Erro ao enviar para WebSocket: {e}")
             disconnected.add(websocket)
@@ -77,13 +90,31 @@ async def broadcast_progress(message: dict):
     for ws in disconnected:
         active_websockets.discard(ws)
 
-@app.post("/extract", response_model=DocumentResponse)
-async def extract_data(file: UploadFile = File(...)):
+@app.post("/extract")
+async def extract_data(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     """
     Recebe um PDF ou imagem, executa OCR via Google Vision e retorna dados estruturados.
     AGORA: Salva tudo no banco de dados para eliminar alucinações
-    COM PROGRESSO EM TEMPO REAL via WebSocket
+    PROCESSO ASSÍNCRONO: Retorna imediatamente para evitar 30s timeout do Render.
     """
+    # Funcao interna para processar em background
+    async def process_task():
+        try:
+            res = await coordinator.process_document_staged(
+                file_content, 
+                arquivo_nome=file.filename,
+                progress_callback=broadcast_progress
+            )
+            # Envia resultado final via WS
+            await broadcast_progress(res.model_dump() if hasattr(res, "model_dump") else res)
+        except Exception as task_err:
+            logger.error(f"Erro na tarefa background: {task_err}", exc_info=True)
+            await broadcast_progress({
+                "type": "ERROR",
+                "message": f"ERRO CRÍTICO: {str(task_err)}",
+                "progress": -1
+            })
+
     logger.info(f"Nova requisicao recebida - Arquivo: {file.filename}")
     
     # Aceitando PDF, PNG, JPG para OCR
@@ -101,30 +132,41 @@ async def extract_data(file: UploadFile = File(...)):
              logger.warning(f"Arquivo muito grande: {len(file_content)} bytes")
              raise HTTPException(status_code=413, detail="Arquivo muito grande. Limite de 20MB.")
 
-        logger.info(f"Arquivo validado: {file.filename} ({len(file_content)} bytes)")
-        logger.info(f"Iniciando processamento OCR...")
+        logger.info(f"Arquivo validado: {file.filename} ({len(file_content)} bytes). Iniciando Background Task...")
 
-        # Coordena extração e parsing
-        response = await coordinator.process_document_staged(
-            file_content, 
-            arquivo_nome=file.filename,
-            progress_callback=broadcast_progress
-        )
+        # Inicia a tarefa em background para não travar a conexão HTTP
+        
+        async def process_task():
+            try:
+                res = await coordinator.process_document_staged(
+                    file_content, 
+                    arquivo_nome=file.filename,
+                    progress_callback=broadcast_progress
+                )
+                # Envia resultado final via WS
+                await broadcast_progress(res.model_dump() if hasattr(res, "model_dump") else res)
+            except Exception as task_err:
+                logger.error(f"Erro na tarefa background: {task_err}", exc_info=True)
+                await broadcast_progress({
+                    "type": "ERROR",
+                    "message": f"ERRO CRÍTICO: {str(task_err)}",
+                    "progress": -1
+                })
 
-        logger.info(f"Processamento concluido com sucesso!")
-        return response
+        background_tasks.add_task(process_task)
+
+        return {
+            "status": "processing",
+            "message": "Auditoria iniciada em background. Acompanhe pelo progresso.",
+            "filename": file.filename
+        }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erro no processamento: {str(e)}", exc_info=True)
-        await broadcast_progress({
-            "message": f"✗ Erro: {str(e)}",
-            "progress": -1,
-            "error": True
-        })
-        raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
-
+        logger.error(f"Erro ao iniciar processamento: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Erro ao iniciar: {str(e)}")
+    
 
 @app.get("/historico")
 async def listar_historico(limite: int = 100):

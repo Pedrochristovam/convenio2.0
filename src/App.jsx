@@ -232,19 +232,32 @@ function App() {
 
     const hasPending = Object.keys(pendingEdits).length > 0
 
-    const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://127.0.0.1:5053'
-    const WS_URL = import.meta.env.VITE_BACKEND_URL
-        ? `${import.meta.env.VITE_BACKEND_URL.replace(/^http/, 'ws')}/ws/progress`
-        : 'ws://127.0.0.1:5053/ws/progress'
-
+    const rawUrl = import.meta.env.VITE_BACKEND_URL || 'http://127.0.0.1:5053'
+    // Remove barras no final para evitar URL quebrada
+    const BACKEND_URL = rawUrl.replace(/\/+$/, '')
+    const WS_URL = BACKEND_URL.replace(/^http/, 'ws') + '/ws/progress'
     // WebSocket
     useEffect(() => {
         const websocket = new WebSocket(WS_URL)
         websocket.onopen = () => console.log('✅ WebSocket conectado')
         websocket.onmessage = (event) => {
             const data = JSON.parse(event.data)
-            setProgressMessage(data.message)
-            setProgressPercent(data.progress)
+
+            if (data.type === 'FINAL_RESULT') {
+                console.log('🏁 Resultado final recebido via WebSocket')
+                setResults(data.data)
+                setLoading(false)
+                setProgressPercent(100)
+                setProgressMessage(data.message || '✓ Concluído!')
+                carregarEstatisticas()
+            } else if (data.type === 'ERROR') {
+                setError(data.message)
+                setLoading(false)
+                setProgressMessage(data.message)
+            } else {
+                setProgressMessage(data.message)
+                setProgressPercent(data.progress)
+            }
         }
         websocket.onerror = (err) => console.error('❌ Erro no WebSocket:', err)
         websocket.onclose = () => console.log('🔌 WebSocket desconectado')
@@ -364,15 +377,19 @@ function App() {
         formData.append('file', file)
         try {
             const r = await fetch(`${BACKEND_URL}/extract`, { method: 'POST', body: formData })
-            if (!r.ok) { const e = await r.json().catch(() => ({ detail: 'Erro desconhecido' })); throw new Error(e.detail) }
+            if (!r.ok) {
+                const e = await r.json().catch(() => ({ detail: 'Erro desconhecido' }));
+                throw new Error(e.detail)
+            }
             const data = await r.json()
-            setResults(data)
-            carregarEstatisticas()
+            console.log('✅ Background task iniciada:', data)
+            // Agora a gente NÃO seta o resultado aqui. 
+            // A gente espera o WebSocket enviar o FINAL_RESULT.
+            setProgressMessage('Auditando em segundo plano (evita timeout)...')
         } catch (e) {
             setError(e.message)
             setProgressMessage(`❌ Erro: ${e.message}`)
-        } finally {
-            setLoading(false)
+            setLoading(false) // Garante que destrava o botão em caso de erro direto no POST
         }
     }
 

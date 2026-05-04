@@ -47,7 +47,8 @@ class ExtractionDatabase:
                 database=self.database,
                 port=self.port,
                 cursorclass=pymysql.cursors.DictCursor,
-                autocommit=True
+                autocommit=True,
+                connect_timeout=3
             )
         except Exception as e:
             return None
