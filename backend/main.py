@@ -97,32 +97,6 @@ async def extract_data(background_tasks: BackgroundTasks, file: UploadFile = Fil
     AGORA: Salva tudo no banco de dados para eliminar alucinações
     PROCESSO ASSÍNCRONO: Retorna imediatamente para evitar 30s timeout do Render.
     """
-    # Funcao interna para processar em background
-    async def process_task():
-        try:
-            res = await coordinator.process_document_staged(
-                file_content, 
-                arquivo_nome=file.filename,
-                progress_callback=broadcast_progress
-            )
-            # Envia resultado final via WS
-            await broadcast_progress(res.model_dump() if hasattr(res, "model_dump") else res)
-        except Exception as task_err:
-            logger.error(f"Erro na tarefa background: {task_err}", exc_info=True)
-            await broadcast_progress({
-                "type": "ERROR",
-                "message": f"ERRO CRÍTICO: {str(task_err)}",
-                "progress": -1
-            })
-
-    logger.info(f"Nova requisicao recebida - Arquivo: {file.filename}")
-    
-    # Aceitando PDF, PNG, JPG para OCR
-    valid_extensions = (".pdf", ".png", ".jpg", ".jpeg", ".txt")
-    if not file.filename.lower().endswith(valid_extensions):
-         logger.warning(f"Extensao invalida: {file.filename}")
-         raise HTTPException(status_code=400, detail="Arquivo não suportado. Use PDF, PNG, JPG ou TXT.")
-
     try:
         # Verifica tamanho do arquivo (Máximo 20MB pedido pelo usuário)
         MAX_SIZE = 20 * 1024 * 1024  # 20MB
