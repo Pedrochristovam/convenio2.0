@@ -2,15 +2,14 @@ fastapi
 uvicorn
 pydantic
 python-multipart
-google-cloud-vision
 pytest
 httpx
 python-dotenv
 Pillow
 numpy
 PyMuPDF
+pytesseract
 groq
-google-generativeai
 websockets
 pymysql
 pandas

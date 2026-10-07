@@ -1,16 +1,24 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks
-from backend.extraction_service import ExtractionCoordinator
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks
+from backend.extraction_service import ExtractionCoordinator, sanitize_filename
 from backend.models import DocumentResponse
 from backend.database import ExtractionDatabase
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from backend.calculation_service import calculator
 from backend.export_service import export_service
+from backend.analise_documental.pipeline import executar_analise, precisa_recalcular, recalcular_analise
+from backend.analise_documental.minuta_ad import gerar_minuta_ad, sugerir_modelo
+from backend.analise_documental.conciliacao_xlsx import gerar_conciliacao
+from backend.analise_documental.diligencia import gerar_oficio, gerar_solicitacao
+from backend.llm_client import get_llm
+from backend.conversao_pdf import ConversaoPdfIndisponivel, docx_para_pdf
 
 import logging
 import asyncio
 import json
+import os
 from datetime import datetime
+from urllib.parse import quote
 
 app = FastAPI(title="Convenio Extração API")
 
@@ -26,6 +34,11 @@ app.add_middleware(
 
 coordinator = ExtractionCoordinator()
 db = ExtractionDatabase()
+db.marcar_interrompidos()
+
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "100"))
+# OCR é a etapa pesada: volumes enviados juntos entram em fila em vez de disputar CPU/memória
+fila_ocr = asyncio.Semaphore(int(os.getenv("OCR_SIMULTANEOS", "1")))
 
 # Gerenciador de conexões WebSocket ativas
 active_websockets = set()
@@ -91,38 +104,62 @@ async def broadcast_progress(message: dict):
         active_websockets.discard(ws)
 
 @app.post("/extract")
-async def extract_data(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+async def extract_data(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    pasta_id: int | None = Form(None),
+):
     """
-    Recebe um PDF ou imagem, executa OCR via Google Vision e retorna dados estruturados.
-    AGORA: Salva tudo no banco de dados para eliminar alucinações
-    PROCESSO ASSÍNCRONO: Retorna imediatamente para evitar 30s timeout do Render.
+    Recebe PDF/imagem, executa OCR híbrido (PDF nativo + Tesseract) e parsers.
+    Persiste tudo no MySQL. Progresso via WebSocket; resultado também em GET /resultados/{arquivo}.
+    Com pasta_id, o arquivo entra no fim da pasta do convênio antes mesmo do OCR começar.
     """
     try:
-        # Verifica tamanho do arquivo (Máximo 20MB pedido pelo usuário)
-        MAX_SIZE = 20 * 1024 * 1024  # 20MB
+        if pasta_id is not None and not db.obter_pasta(pasta_id):
+            raise HTTPException(status_code=404, detail="Pasta não encontrada")
+        arquivo = sanitize_filename(file.filename or "documento.pdf")
+        job = db.obter_ultimo_job(arquivo)
+        if job and job.get("status") in ("fila", "processando"):
+            raise HTTPException(status_code=409, detail=f"{file.filename} já está sendo processado.")
+
         file_content = await file.read()
-        
-        if len(file_content) > MAX_SIZE:
+
+        if len(file_content) > MAX_UPLOAD_MB * 1024 * 1024:
              logger.warning(f"Arquivo muito grande: {len(file_content)} bytes")
-             raise HTTPException(status_code=413, detail="Arquivo muito grande. Limite de 20MB.")
+             raise HTTPException(status_code=413, detail=f"Arquivo muito grande. Limite de {MAX_UPLOAD_MB} MB.")
 
         logger.info(f"Arquivo validado: {file.filename} ({len(file_content)} bytes). Iniciando Background Task...")
 
-        # Inicia a tarefa em background para não travar a conexão HTTP
-        
+        if pasta_id is not None:
+            db.vincular_arquivo(pasta_id, arquivo)
+        agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        db.registrar_job(arquivo, agora, "fila", mensagem="Aguardando OCR")
+
+        async def progresso_do_arquivo(msg: dict):
+            if isinstance(msg, dict) and "resumos_mensais" not in msg and "movimentacoes_cc" not in msg:
+                msg.setdefault("arquivo", arquivo)
+            await broadcast_progress(msg)
+
         async def process_task():
             try:
-                res = await coordinator.process_document_staged(
-                    file_content, 
-                    arquivo_nome=file.filename,
-                    progress_callback=broadcast_progress
-                )
-                # Envia resultado final via WS
+                if fila_ocr.locked():
+                    await progresso_do_arquivo({
+                        "message": f"{file.filename}: na fila, aguardando o término do arquivo em processamento...",
+                        "progress": 0,
+                    })
+                async with fila_ocr:
+                    res = await coordinator.process_document_staged(
+                        file_content,
+                        arquivo_nome=file.filename,
+                        progress_callback=progresso_do_arquivo
+                    )
                 await broadcast_progress(res.model_dump() if hasattr(res, "model_dump") else res)
             except Exception as task_err:
                 logger.error(f"Erro na tarefa background: {task_err}", exc_info=True)
+                db.atualizar_job(arquivo, agora, "erro", mensagem=str(task_err))
                 await broadcast_progress({
                     "type": "ERROR",
+                    "arquivo": arquivo,
                     "message": f"ERRO CRÍTICO: {str(task_err)}",
                     "progress": -1
                 })
@@ -132,7 +169,9 @@ async def extract_data(background_tasks: BackgroundTasks, file: UploadFile = Fil
         return {
             "status": "processing",
             "message": "Auditoria iniciada em background. Acompanhe pelo progresso.",
-            "filename": file.filename
+            "filename": file.filename,
+            "arquivo": arquivo,
+            "pasta_id": pasta_id,
         }
         
     except HTTPException:
@@ -144,9 +183,9 @@ async def extract_data(background_tasks: BackgroundTasks, file: UploadFile = Fil
 
 @app.get("/historico")
 async def listar_historico(limite: int = 100):
-    """Lista todas as extrações gravadas no banco"""
+    """Lista arquivos processados (jobs reais: resumos + CC)."""
     try:
-        registros = db.listar_todas_extracoes(limite=limite)
+        registros = db.listar_historico_arquivos(limite=limite)
         return {
             "total": len(registros),
             "registros": registros
@@ -158,17 +197,329 @@ async def listar_historico(limite: int = 100):
 
 @app.get("/historico/{arquivo_nome}")
 async def listar_por_arquivo(arquivo_nome: str):
-    """Lista a última extração de um arquivo específico"""
+    """Retorna o último resultado completo de um arquivo (MySQL)."""
     try:
-        registros = db.listar_ultima_extracao(arquivo_nome)
-        return {
-            "arquivo": arquivo_nome,
-            "total": len(registros),
-            "registros": registros
-        }
+        return db.obter_resultados_arquivo(arquivo_nome)
     except Exception as e:
         logger.error(f"Erro ao listar arquivo: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Erro ao listar arquivo: {str(e)}")
+
+
+@app.get("/resultados/{arquivo_nome}")
+async def obter_resultados(arquivo_nome: str):
+    """Recupera resultados do MySQL sem depender do WebSocket."""
+    try:
+        data = db.obter_resultados_arquivo(arquivo_nome)
+        job = data.get("job") or {}
+        # Enquanto processa, não devolve resultado parcial como "final"
+        if job.get("status") == "processando":
+            return {
+                "arquivo": arquivo_nome,
+                "status": "processando",
+                "total_resumos": data["total_resumos"],
+                "total_cc": data["total_cc"],
+                "job": job,
+            }
+        # Volume sem extratos (ex.: celebração) termina sem resumos/CC, mas com OCR gravado
+        if data["total_resumos"] == 0 and data["total_cc"] == 0 and job.get("status") not in ("concluido", "erro"):
+            raise HTTPException(status_code=404, detail="Nenhum resultado encontrado para este arquivo.")
+        data["status"] = job.get("status") or "concluido"
+        return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erro ao obter resultados: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/job/{arquivo_nome}")
+async def obter_job(arquivo_nome: str):
+    job = db.obter_ultimo_job(arquivo_nome)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job não encontrado")
+    return job
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ANÁLISE DOCUMENTAL (dossiê de um convênio = vários arquivos já processados)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _processar_dossie(dossie_id: int, arquivos: list):
+    async def progresso(msg: str, pct: int):
+        db.atualizar_dossie(dossie_id, progresso=pct, mensagem=msg)
+        await broadcast_progress({"type": "DOSSIE_PROGRESS", "dossie_id": dossie_id, "message": msg, "progress": pct})
+
+    try:
+        resultado = await executar_analise(db, arquivos, llm=get_llm(), progress=progresso)
+        db.atualizar_dossie(dossie_id, status="concluido", progresso=100, mensagem="Concluído", resultado=resultado)
+        await broadcast_progress({"type": "DOSSIE_DONE", "dossie_id": dossie_id, "progress": 100})
+    except Exception as exc:
+        logger.error("Dossiê %s falhou: %s", dossie_id, exc, exc_info=True)
+        db.atualizar_dossie(dossie_id, status="erro", mensagem=str(exc))
+        await broadcast_progress({"type": "DOSSIE_ERROR", "dossie_id": dossie_id, "message": str(exc), "progress": -1})
+
+
+@app.post("/dossies")
+async def criar_dossie(payload: dict, background_tasks: BackgroundTasks):
+    """Cria o dossiê e roda inventário + extração + Relatório de Validação em background."""
+    nome = (payload.get("nome") or "").strip()
+    arquivos = [a for a in (payload.get("arquivos") or []) if isinstance(a, str) and a.strip()]
+    if not nome or not arquivos:
+        raise HTTPException(status_code=400, detail="Informe 'nome' e ao menos um arquivo em 'arquivos'.")
+    sem_ocr = [a for a in arquivos if not db.obter_ultimo_job(a)]
+    if sem_ocr:
+        raise HTTPException(status_code=400, detail=f"Arquivo(s) ainda não processado(s): {', '.join(sem_ocr)}")
+    dossie_id = db.criar_dossie(nome, arquivos)
+    background_tasks.add_task(_processar_dossie, dossie_id, arquivos)
+    return {"id": dossie_id, "status": "processando"}
+
+
+@app.get("/dossies")
+async def listar_dossies(limite: int = 100):
+    return {"dossies": db.listar_dossies(limite)}
+
+
+@app.get("/dossies/{dossie_id}")
+async def obter_dossie(dossie_id: int):
+    dossie = db.obter_dossie(dossie_id)
+    if not dossie:
+        raise HTTPException(status_code=404, detail="Dossiê não encontrado")
+    if dossie["status"] == "concluido" and precisa_recalcular(dossie.get("resultado")):
+        try:
+            await asyncio.to_thread(_recalcular, dossie)
+        except Exception as exc:
+            logger.warning("Recálculo automático do dossiê %s falhou: %s", dossie_id, exc, exc_info=True)
+    return dossie
+
+
+@app.post("/dossies/{dossie_id}/reprocessar")
+async def reprocessar_dossie(dossie_id: int, background_tasks: BackgroundTasks):
+    dossie = db.obter_dossie(dossie_id)
+    if not dossie:
+        raise HTTPException(status_code=404, detail="Dossiê não encontrado")
+    if dossie["status"] == "processando":
+        raise HTTPException(status_code=409, detail="Dossiê já está em processamento")
+    db.atualizar_dossie(dossie_id, status="processando", progresso=0, mensagem="Na fila")
+    background_tasks.add_task(_processar_dossie, dossie_id, dossie["arquivos"])
+    return {"id": dossie_id, "status": "processando"}
+
+
+def _recalcular(dossie: dict) -> dict:
+    resultado = recalcular_analise(db, dossie["resultado"])
+    db.atualizar_dossie(dossie["id"], resultado=resultado)
+    dossie["resultado"] = resultado
+    return dossie
+
+
+def _dossie_concluido(dossie_id: int) -> dict:
+    dossie = db.obter_dossie(dossie_id)
+    if not dossie:
+        raise HTTPException(status_code=404, detail="Dossiê não encontrado")
+    if dossie["status"] != "concluido" or not dossie.get("resultado"):
+        raise HTTPException(status_code=409, detail="Dossiê ainda não concluído")
+    # Análises gravadas antes do formato GECOV são atualizadas sem nova chamada à IA
+    if precisa_recalcular(dossie["resultado"]):
+        try:
+            _recalcular(dossie)
+        except Exception as exc:
+            logger.warning("Recálculo automático do dossiê %s falhou: %s", dossie_id, exc, exc_info=True)
+    return dossie
+
+
+@app.post("/dossies/{dossie_id}/recalcular")
+async def recalcular_dossie(dossie_id: int):
+    """Refaz varredura, cruzamentos, relatório e parecer sobre a classificação já gravada (sem IA)."""
+    dossie = db.obter_dossie(dossie_id)
+    if not dossie:
+        raise HTTPException(status_code=404, detail="Dossiê não encontrado")
+    if dossie["status"] != "concluido" or not dossie.get("resultado"):
+        raise HTTPException(status_code=409, detail="Dossiê ainda não concluído")
+    try:
+        await asyncio.to_thread(_recalcular, dossie)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return dossie
+
+
+def _arquivo(conteudo: bytes, nome: str, media_type: str) -> Response:
+    return Response(
+        content=conteudo,
+        media_type=media_type,
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(nome)}"},
+    )
+
+
+@app.get("/dossies/{dossie_id}/saida-tct")
+async def saida_tct_dossie(dossie_id: int):
+    """Modelo de AD sugerido (pelo regime jurídico) e indícios de inexecução."""
+    return sugerir_modelo(_dossie_concluido(dossie_id)["resultado"])
+
+
+@app.get("/dossies/{dossie_id}/minuta-ad")
+async def minuta_ad_dossie(dossie_id: int, modelo: str | None = None, formato: str = "pdf"):
+    """Minuta da Análise Documental no modelo do Novo TCT (DEC_43635, DEC_46319 ou INEXECUCAO), em PDF ou DOCX."""
+    dossie = _dossie_concluido(dossie_id)
+    try:
+        conteudo, nome = gerar_minuta_ad(dossie["resultado"], dossie["nome"], modelo)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if formato == "docx":
+        return _arquivo(conteudo, nome, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    try:
+        pdf = await asyncio.to_thread(docx_para_pdf, conteudo)
+    except ConversaoPdfIndisponivel as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return _arquivo(pdf, os.path.splitext(nome)[0] + ".pdf", "application/pdf")
+
+
+@app.get("/dossies/{dossie_id}/conciliacao")
+async def conciliacao_dossie(dossie_id: int, inexecucao: bool = False):
+    """Planilha de Conciliação Financeira (GECOV/GECON) pré-preenchida."""
+    dossie = _dossie_concluido(dossie_id)
+    conteudo, nome = gerar_conciliacao(dossie["resultado"], inexecucao)
+    return _arquivo(conteudo, nome, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+async def _docx_ou_pdf(conteudo: bytes, nome: str, formato: str) -> Response:
+    if formato == "docx":
+        return _arquivo(conteudo, nome, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    try:
+        pdf = await asyncio.to_thread(docx_para_pdf, conteudo)
+    except ConversaoPdfIndisponivel as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return _arquivo(pdf, os.path.splitext(nome)[0] + ".pdf", "application/pdf")
+
+
+@app.get("/dossies/{dossie_id}/solicitacao")
+async def solicitacao_dossie(dossie_id: int, formato: str = "pdf"):
+    """Anexo – Solicitação de Documentos (diligência ao convenente), no modelo da GECOV."""
+    dossie = _dossie_concluido(dossie_id)
+    try:
+        conteudo, nome = gerar_solicitacao(dossie["resultado"])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return await _docx_ou_pdf(conteudo, nome, formato)
+
+
+@app.get("/dossies/{dossie_id}/oficio")
+async def oficio_dossie(dossie_id: int, formato: str = "docx"):
+    """Minuta do Ofício de solicitação de documentos complementares (campos do SEI destacados em amarelo)."""
+    dossie = _dossie_concluido(dossie_id)
+    try:
+        conteudo, nome = gerar_oficio(dossie["resultado"])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return await _docx_ou_pdf(conteudo, nome, formato)
+
+
+@app.delete("/dossies/{dossie_id}")
+async def excluir_dossie(dossie_id: int):
+    if not db.excluir_dossie(dossie_id):
+        raise HTTPException(status_code=404, detail="Dossiê não encontrado")
+    return {"success": True}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PASTAS DE CONVÊNIO (destino obrigatório dos volumes enviados)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pasta_ou_404(pasta_id: int) -> dict:
+    pasta = db.obter_pasta(pasta_id)
+    if not pasta:
+        raise HTTPException(status_code=404, detail="Pasta não encontrada")
+    return pasta
+
+
+@app.get("/pastas")
+async def listar_pastas():
+    return {"pastas": db.listar_pastas(), "sem_pasta": db.arquivos_sem_pasta()}
+
+
+@app.post("/pastas")
+async def criar_pasta(payload: dict):
+    nome = (payload.get("nome") or "").strip()
+    if not nome:
+        raise HTTPException(status_code=400, detail="Informe o nome da pasta.")
+    pasta_id = db.criar_pasta(
+        nome,
+        (payload.get("numero_convenio") or "").strip(),
+        (payload.get("convenente") or "").strip(),
+        (payload.get("observacao") or "").strip(),
+    )
+    return db.obter_pasta(pasta_id)
+
+
+@app.get("/pastas/{pasta_id}")
+async def obter_pasta(pasta_id: int):
+    return _pasta_ou_404(pasta_id)
+
+
+@app.patch("/pastas/{pasta_id}")
+async def atualizar_pasta(pasta_id: int, payload: dict):
+    _pasta_ou_404(pasta_id)
+    campos = {k: (v.strip() if isinstance(v, str) else v) for k, v in payload.items()}
+    if "nome" in campos and not campos["nome"]:
+        raise HTTPException(status_code=400, detail="O nome da pasta não pode ficar vazio.")
+    db.atualizar_pasta(pasta_id, campos)
+    return db.obter_pasta(pasta_id)
+
+
+@app.delete("/pastas/{pasta_id}")
+async def excluir_pasta(pasta_id: int, apagar_dados: bool = True):
+    pasta = _pasta_ou_404(pasta_id)
+    if any(a["status"] in ("fila", "processando") for a in pasta["arquivos"]):
+        raise HTTPException(status_code=409, detail="Há volumes sendo processados nesta pasta. Aguarde terminar.")
+    db.excluir_pasta(pasta_id, apagar_dados=apagar_dados)
+    return {"success": True}
+
+
+@app.put("/pastas/{pasta_id}/ordem")
+async def reordenar_pasta(pasta_id: int, payload: dict):
+    pasta = _pasta_ou_404(pasta_id)
+    arquivos = payload.get("arquivos") or []
+    if sorted(arquivos) != sorted(a["arquivo_nome"] for a in pasta["arquivos"]):
+        raise HTTPException(status_code=400, detail="A nova ordem deve conter exatamente os arquivos da pasta.")
+    db.reordenar_pasta(pasta_id, arquivos)
+    return db.obter_pasta(pasta_id)
+
+
+@app.post("/pastas/{pasta_id}/arquivos")
+async def mover_arquivo_para_pasta(pasta_id: int, payload: dict):
+    """Coloca na pasta um arquivo já processado (ex.: enviado antes de existirem pastas)."""
+    _pasta_ou_404(pasta_id)
+    arquivo = (payload.get("arquivo_nome") or "").strip()
+    if not arquivo or not db.obter_ultimo_job(arquivo):
+        raise HTTPException(status_code=404, detail="Arquivo não encontrado")
+    db.vincular_arquivo(pasta_id, arquivo)
+    return db.obter_pasta(pasta_id)
+
+
+@app.delete("/pastas/{pasta_id}/arquivos/{arquivo_nome}")
+async def remover_arquivo_da_pasta(pasta_id: int, arquivo_nome: str, apagar_dados: bool = False):
+    pasta = _pasta_ou_404(pasta_id)
+    item = next((a for a in pasta["arquivos"] if a["arquivo_nome"] == arquivo_nome), None)
+    if not item:
+        raise HTTPException(status_code=404, detail="Arquivo não está nesta pasta")
+    if item["status"] in ("fila", "processando"):
+        raise HTTPException(status_code=409, detail="O arquivo ainda está sendo processado.")
+    db.remover_arquivo_pasta(pasta_id, arquivo_nome, apagar_dados=apagar_dados)
+    return db.obter_pasta(pasta_id)
+
+
+@app.post("/pastas/{pasta_id}/analise")
+async def analisar_pasta(pasta_id: int, background_tasks: BackgroundTasks):
+    """Gera a Análise Documental com todos os volumes da pasta, na ordem do processo."""
+    pasta = _pasta_ou_404(pasta_id)
+    if any(a["status"] in ("fila", "processando") for a in pasta["arquivos"]):
+        raise HTTPException(status_code=409, detail="Aguarde o término do processamento de todos os volumes.")
+    if any(a["status"] == "processando" for a in pasta["analises"]):
+        raise HTTPException(status_code=409, detail="Já existe uma análise em andamento para esta pasta.")
+    arquivos = [a["arquivo_nome"] for a in pasta["arquivos"] if a["status"] == "concluido"]
+    if not arquivos:
+        raise HTTPException(status_code=400, detail="A pasta não tem volumes processados com sucesso.")
+    dossie_id = db.criar_dossie(pasta["nome"], arquivos, pasta_id=pasta_id)
+    background_tasks.add_task(_processar_dossie, dossie_id, arquivos)
+    return {"id": dossie_id, "status": "processando"}
 
 
 @app.get("/estatisticas")

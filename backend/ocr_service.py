@@ -1,194 +1,264 @@
-import os
-import base64
-from typing import List
-import httpx
+"""
+OCR híbrido para produção (sem Google Vision):
+1. PDF digital  → texto nativo via PyMuPDF
+2. PDF escaneado / texto fraco → rasteriza + Tesseract (pt)
+3. Imagem       → Tesseract (+ pré-processamento adaptativo se necessário)
+"""
 
-from dotenv import load_dotenv
-import logging
-import fitz  # PyMuPDF
+from __future__ import annotations
+
+import asyncio
 import io
+import logging
+import os
+import re
+from dataclasses import dataclass
+from typing import Callable, List, Optional
+
+import fitz  # PyMuPDF
+from dotenv import load_dotenv
 from PIL import Image
 
 from backend.adaptive_preprocessing import AdaptiveImagePreprocessor
 
-
 load_dotenv()
-
 logger = logging.getLogger(__name__)
 
-class GoogleVisionOCR:
+# O Tesseract abre várias threads por página (OpenMP); com 1 a CPU não dispara e o
+# ganho de velocidade perdido é pequeno no modo psm 6. Ajustável por TESSERACT_THREADS.
+os.environ.setdefault("OMP_THREAD_LIMIT", os.getenv("TESSERACT_THREADS", "1"))
+
+# Qualidade mínima para aceitar texto nativo do PDF
+MIN_NATIVE_CHARS = 40
+MIN_NATIVE_DIGITS = 4
+# Abaixo disso o texto do Tesseract é tratado como lixo (página deitada, foto, carimbo)
+LOW_QUALITY_SCORE = 0.35
+
+
+@dataclass
+class PageOCRResult:
+    text: str
+    engine: str  # native | tesseract | tesseract_enhanced | tesseract_rotacionado
+    char_count: int = 0
+
+    def __post_init__(self):
+        self.char_count = len(self.text or "")
+
+
+class HybridOCR:
+    """Extrator local: PyMuPDF + Tesseract. Interface estável para o coordinator."""
+
     def __init__(self):
-        self.api_key = os.getenv("GOOGLE_VISION_API_KEY")
-        self.url = f"https://vision.googleapis.com/v1/images:annotate?key={self.api_key}"
         self.preprocessor = AdaptiveImagePreprocessor()
-        logger.info("OCR Adaptativo: melhora imagens APENAS quando necessario")
+        self.tesseract_cmd = os.getenv("TESSERACT_CMD", "").strip()
+        self.tesseract_lang = os.getenv("TESSERACT_LANG", "por+eng")
+        self.tesseract_config = os.getenv("TESSERACT_CONFIG", "--oem 3 --psm 6")
+        self._tesseract_ready = False
+        self._init_tesseract()
+        logger.info(
+            "HybridOCR pronto (native PDF + Tesseract). tesseract=%s lang=%s",
+            "OK" if self._tesseract_ready else "INDISPONÍVEL",
+            self.tesseract_lang,
+        )
 
-    async def extract_text_pages(self, file_content: bytes, progress_callback=None) -> List[str]:
-        """
-        Envia o conteúdo do arquivo para o Google Vision API e retorna uma lista de textos por página.
-        Memória-eficiente: Processa em lotes sem carregar todas as imagens simultaneamente.
-        COM PROGRESSO EM TEMPO REAL
-        """
-        if not self.api_key:
-            logger.error("ERRO: GOOGLE_VISION_API_KEY nao configurada em .env")
-            return []
-
-        logger.info(f"API Key configurada: {self.api_key[:10]}...")
-        is_pdf = file_content.startswith(b"%PDF-")
-        logger.info(f"Tipo de arquivo: {'PDF' if is_pdf else 'Imagem'}")
-        page_texts = []
-        
+    def _init_tesseract(self) -> None:
         try:
-            async with httpx.AsyncClient() as client:
-                if is_pdf:
-                    logger.info("Processando PDF multi-pagina...")
-                    doc = fitz.open(stream=file_content, filetype="pdf")
-                    num_pages = len(doc)
-                    logger.info(f"Total de paginas: {num_pages}")
-                    
-                    # Notifica início
-                    if progress_callback:
-                        await progress_callback({
-                            "message": f"Iniciando OCR de {num_pages} páginas...",
+            import pytesseract
+
+            if self.tesseract_cmd:
+                pytesseract.pytesseract.tesseract_cmd = self.tesseract_cmd
+            # Smoke test
+            pytesseract.get_tesseract_version()
+            self._tesseract_ready = True
+        except Exception as e:
+            self._tesseract_ready = False
+            logger.error("Tesseract indisponível: %s", e)
+
+    @staticmethod
+    def _is_weak_text(text: str) -> bool:
+        if not text or len(text.strip()) < MIN_NATIVE_CHARS:
+            return True
+        digits = len(re.findall(r"\d", text))
+        return digits < MIN_NATIVE_DIGITS
+
+    @staticmethod
+    def text_quality(text: str) -> float:
+        """Fração do texto formada por palavras legíveis (0 = lixo de OCR, 1 = texto limpo)."""
+        if not text:
+            return 0.0
+        compact = re.sub(r"\s+", "", text)
+        if not compact:
+            return 0.0
+        words = re.findall(r"[A-Za-zÀ-ÿ]{4,}", text)
+        good = sum(len(w) for w in words if re.search(r"[aeiouáéíóúâêôãõAEIOUÁÉÍÓÚÂÊÔÃÕ]", w))
+        return good / len(compact)
+
+    @staticmethod
+    def _open_image(data: bytes) -> Image.Image:
+        image = Image.open(io.BytesIO(data))
+        if image.mode not in ("RGB", "L"):
+            image = image.convert("RGB")
+        return image
+
+    def _ocr_pil(self, image: Image.Image) -> str:
+        import pytesseract
+
+        text = pytesseract.image_to_string(
+            image,
+            lang=self.tesseract_lang,
+            config=self.tesseract_config,
+        )
+        return (text or "").strip()
+
+    def _ocr_image_bytes(self, img_bytes: bytes, enhance: bool = False) -> str:
+        if not self._tesseract_ready:
+            logger.error("Tesseract não disponível — página sem OCR")
+            return ""
+
+        data = img_bytes
+        if enhance:
+            data = self.preprocessor.enhance_image(img_bytes)
+        return self._ocr_pil(self._open_image(data))
+
+    def _ocr_rotated(self, img_bytes: bytes) -> Optional[str]:
+        """Detecta página digitalizada deitada/invertida (OSD) e refaz o OCR já rotacionada."""
+        if not self._tesseract_ready:
+            return None
+        import pytesseract
+
+        image = self._open_image(img_bytes)
+        try:
+            osd = pytesseract.image_to_osd(image, config="--psm 0")
+        except Exception:
+            # Fotos e páginas quase sem texto não têm caracteres suficientes para o OSD
+            return None
+        rot = re.search(r"Rotate:\s*(\d+)", osd)
+        conf = re.search(r"Orientation confidence:\s*([\d.]+)", osd)
+        if not rot or int(rot.group(1)) == 0:
+            return None
+        if conf and float(conf.group(1)) < 1.0:
+            return None
+        return self._ocr_pil(image.rotate(-int(rot.group(1)), expand=True))
+
+    async def _ocr_image_async(self, img_bytes: bytes, enhance: bool = False) -> str:
+        return await asyncio.to_thread(self._ocr_image_bytes, img_bytes, enhance)
+
+    async def _ocr_best(self, img_bytes: bytes, page_label: str) -> tuple:
+        """OCR com duas tentativas de recuperação: rotação (OSD) e pré-processamento."""
+        text = await self._ocr_image_async(img_bytes, enhance=False)
+        engine = "tesseract"
+
+        if self.text_quality(text) < LOW_QUALITY_SCORE:
+            rotated = await asyncio.to_thread(self._ocr_rotated, img_bytes)
+            if rotated and self.text_quality(rotated) > self.text_quality(text):
+                logger.info("%s: página rotacionada corrigida pelo OSD", page_label)
+                text, engine = rotated, "tesseract_rotacionado"
+
+        if self.preprocessor.should_enhance(text):
+            logger.warning("%s: OCR fraco, tentando pré-processamento", page_label)
+            retry = await self._ocr_image_async(img_bytes, enhance=True)
+            if len(retry) > len(text) and self.text_quality(retry) >= self.text_quality(text):
+                text, engine = retry, "tesseract_enhanced"
+        return text, engine
+
+    def _page_to_png(self, page: fitz.Page, zoom: float = 2.5) -> bytes:
+        # Cinza ocupa 1/3 da memória do RGB e o Tesseract binariza a imagem de qualquer forma
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csGRAY, alpha=False)
+        return pix.tobytes("png")
+
+    async def _extract_pdf_page(
+        self, page: fitz.Page, page_num: int
+    ) -> PageOCRResult:
+        native = (page.get_text("text") or "").strip()
+        if not self._is_weak_text(native):
+            logger.info("Página %s: texto nativo (%s chars)", page_num, len(native))
+            return PageOCRResult(text=native, engine="native")
+
+        logger.info(
+            "Pagina %s: texto nativo fraco (%s chars) -> Tesseract",
+            page_num,
+            len(native),
+        )
+        img_bytes = await asyncio.to_thread(self._page_to_png, page, 2.5)
+        text, engine = await self._ocr_best(img_bytes, f"Página {page_num}")
+
+        # Se Tesseract falhou mas havia algum nativo, usa o nativo como fallback
+        if not text and native:
+            return PageOCRResult(text=native, engine="native_weak")
+
+        return PageOCRResult(text=text, engine=engine)
+
+    async def extract_pages_detailed(
+        self,
+        file_content: bytes,
+        progress_callback: Optional[Callable] = None,
+    ) -> List[PageOCRResult]:
+        is_pdf = file_content.startswith(b"%PDF-")
+        results: List[PageOCRResult] = []
+
+        try:
+            if is_pdf:
+                doc = fitz.open(stream=file_content, filetype="pdf")
+                num_pages = len(doc)
+                logger.info("HybridOCR PDF: %s páginas", num_pages)
+
+                if progress_callback:
+                    await progress_callback(
+                        {
+                            "message": f"Extraindo texto de {num_pages} páginas (PDF nativo + Tesseract)...",
                             "progress": 0,
                             "step": 0,
-                            "total_steps": num_pages * 2
-                        })
-                    
-                    BATCH_SIZE = 3 # Lote MUITO menor para documentos grandes (82 páginas)
-                    
-                    for i in range(0, num_pages, BATCH_SIZE):
-                        batch_images = []
-                        end_page = min(i + BATCH_SIZE, num_pages)
-                        
-                        logger.info(f"Convertendo lote de páginas {i+1} até {end_page}...")
-                        
-                        for page_num in range(i, end_page):
-                            # Notifica pré-processamento
-                            if progress_callback:
-                                await progress_callback({
-                                    "message": f"Convertendo página {page_num+1}/{num_pages} para imagem",
-                                    "progress": int((page_num / num_pages) * 50),  # Primeiros 50%
-                                    "step": page_num,
-                                    "total_steps": num_pages * 2
-                                })
-                            
-                            page = doc.load_page(page_num)
-                            # Matrix(2,2) é mais que suficiente para o Google Vision e economiza MUITA memória em arquivos grandes
-                            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                            img_bytes = pix.tobytes("png")
-                            
-                            # SEM PRÉ-PROCESSAMENTO (Google Vision funciona melhor com imagem original)
-                            
-                            batch_images.append(img_bytes)
-                        
-                        # Notifica envio para API
-                        if progress_callback:
-                            await progress_callback({
-                                "message": f"Lendo texto das páginas {i+1} até {end_page} (OCR)...",
-                                "progress": int((i / num_pages) * 50) + 50,  # Últimos 50%
-                                "step": i + BATCH_SIZE,
-                                "total_steps": num_pages * 2
-                            })
-                        
-                        # Processa o lote na API
-                        requests = []
-                        for img_bytes in batch_images:
-                            base64_image = base64.b64encode(img_bytes).decode("utf-8")
-                            requests.append({
-                                "image": {"content": base64_image},
-                                "features": [{"type": "TEXT_DETECTION"}]
-                            })
-                        
-                        logger.info(f"Enviando lote {i//BATCH_SIZE + 1} para Google Vision...")
-                        response = await client.post(self.url, json={"requests": requests}, timeout=300.0)
-                        logger.info(f"Status da resposta: {response.status_code}")
-                        response.raise_for_status()
-                        
-                        data = response.json()
-                        logger.info(f"Resposta recebida: {len(data.get('responses', []))} paginas processadas")
-                        
-                        for idx, res in enumerate(data.get("responses", [])):
-                            page_index = i + idx
-                            if "error" in res:
-                                logger.error(f"ERRO na pagina {page_index+1}: {res['error']}")
-                                page_texts.append("")
-                            else:
-                                text = res.get("fullTextAnnotation", {}).get("text", "")
-                                logger.info(f"Pagina {page_index+1}: {len(text)} caracteres extraidos")
-                                
-                                # ADAPTATIVO: Se resultado ruim, tenta melhorar imagem
-                                if self.preprocessor.should_enhance(text) and page_index < len(batch_images):
-                                    logger.warning(f"Pagina {page_index+1}: Qualidade baixa, aplicando melhorias...")
-                                    
-                                    # Melhora a imagem
-                                    enhanced_img = self.preprocessor.enhance_image(batch_images[idx])
-                                    
-                                    # Tenta OCR novamente com imagem melhorada
-                                    base64_enhanced = base64.b64encode(enhanced_img).decode("utf-8")
-                                    retry_payload = {
-                                        "requests": [{
-                                            "image": {"content": base64_enhanced},
-                                            "features": [{"type": "TEXT_DETECTION"}]
-                                        }]
-                                    }
-                                    
-                                    retry_response = await client.post(self.url, json=retry_payload, timeout=300.0)
-                                    retry_response.raise_for_status()
-                                    retry_data = retry_response.json()
-                                    retry_text = retry_data.get("responses", [{}])[0].get("fullTextAnnotation", {}).get("text", "")
-                                    
-                                    # Compara resultados e usa o melhor
-                                    if len(retry_text) > len(text):
-                                        logger.info(f"Pagina {page_index+1}: Imagem melhorada deu resultado MELHOR ({len(retry_text)} vs {len(text)} caracteres)")
-                                        text = retry_text
-                                    else:
-                                        logger.info(f"Pagina {page_index+1}: Imagem original era MELHOR")
-                                
-                                page_texts.append(text)
-                        
-                        # Limpa referências para o GC
-                        del batch_images
-                        del requests
-                        
-                    doc.close()
-                else:
-                    # Imagem única
-                    logger.info("Processando imagem unica...")
-                    
-                    if progress_callback:
-                        await progress_callback({
-                            "message": "Convertendo imagem...",
-                            "progress": 25
-                        })
-                    
-                    # SEM PRÉ-PROCESSAMENTO (Google Vision funciona melhor com imagem original)
-                    
-                    if progress_callback:
-                        await progress_callback({
-                            "message": "Lendo texto da imagem (OCR)...",
-                            "progress": 50
-                        })
-                    
-                    base64_image = base64.b64encode(file_content).decode("utf-8")
-                    payload = {
-                        "requests": [{"image": {"content": base64_image}, "features": [{"type": "TEXT_DETECTION"}]}]
-                    }
-                    response = await client.post(self.url, json=payload, timeout=60.0)
-                    response.raise_for_status()
-                    data = response.json()
-                    text = data.get("responses", [{}])[0].get("fullTextAnnotation", {}).get("text", "")
-                    page_texts.append(text)
+                            "total_steps": num_pages,
+                        }
+                    )
 
-            logger.info(f"OCR concluido: {len(page_texts)} paginas processadas")
-            return page_texts
+                for page_num in range(num_pages):
+                    if progress_callback:
+                        await progress_callback(
+                            {
+                                "message": f"Lendo página {page_num + 1}/{num_pages}...",
+                                "progress": int((page_num / max(num_pages, 1)) * 100),
+                                "step": page_num + 1,
+                                "total_steps": num_pages,
+                            }
+                        )
+                    page = doc.load_page(page_num)
+                    result = await self._extract_pdf_page(page, page_num + 1)
+                    results.append(result)
+                    logger.info(
+                        "Página %s: engine=%s chars=%s",
+                        page_num + 1,
+                        result.engine,
+                        result.char_count,
+                    )
+
+                doc.close()
+            else:
+                if progress_callback:
+                    await progress_callback(
+                        {"message": "OCR da imagem (Tesseract)...", "progress": 30}
+                    )
+                text, engine = await self._ocr_best(file_content, "Imagem")
+                results.append(PageOCRResult(text=text, engine=engine))
+                if progress_callback:
+                    await progress_callback({"message": "OCR concluído", "progress": 100})
+
+            logger.info("HybridOCR concluído: %s páginas", len(results))
+            return results
 
         except Exception as e:
-            print(f"ERRO CRITICO NO OCR: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            logger.error(f"Erro critico no OCR: {str(e)}", exc_info=True)
-            return page_texts
+            logger.error("Erro crítico no HybridOCR: %s", e, exc_info=True)
+            return results
+
+    async def extract_text_pages(
+        self,
+        file_content: bytes,
+        progress_callback: Optional[Callable] = None,
+    ) -> List[str]:
+        """Compatível com a API antiga (só textos)."""
+        detailed = await self.extract_pages_detailed(file_content, progress_callback)
+        return [p.text for p in detailed]
 
 
-
+# Alias legado: qualquer import antigo de GoogleVisionOCR usa o híbrido
+GoogleVisionOCR = HybridOCR

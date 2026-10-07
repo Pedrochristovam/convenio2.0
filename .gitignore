@@ -30,6 +30,11 @@ active_port.txt
 raw_ocr_debug.txt
 parser_debug.log
 
+# Scripts e saídas de teste locais (contêm documentos reais de convênios)
+/_*.py
+/_modelos_tmp/
+/_prompt_mestre.txt
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

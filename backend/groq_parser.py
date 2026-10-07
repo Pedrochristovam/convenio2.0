@@ -16,30 +16,30 @@ logger = logging.getLogger(__name__)
 
 class GroqParser:
     """
-    Parser usando Groq (Llama 3.1 70B) para extração de resumos e conta corrente
-    
-    Vantagens:
-    - 100% GRÁTIS (sem limites por enquanto)
-    - MUITO rápido (mais que OpenAI)
-    - Funciona com QUALQUER layout
-    - Zero configuração (só precisa de API key)
+    Parser usando Groq para extração de resumos e conta corrente (Plan B).
     """
     
     def __init__(self):
-        api_key = os.getenv("GROQ_API_KEY")
-        
-        if not api_key:
-            raise ValueError("GROQ_API_KEY não configurada no .env")
-        
+        api_key = (os.getenv("GROQ_API_KEY") or "").strip()
+        self.enabled = bool(api_key)
+        self.client = None
+        # Modelo atual da conta Groq (llama-3.3 foi descontinuado/indisponível)
+        self.model = (os.getenv("GROQ_MODEL") or "openai/gpt-oss-120b").strip()
+
+        if not self.enabled:
+            logger.warning("GROQ_API_KEY ausente — Plan B (IA) desativado; parsers determinísticos seguem ativos")
+            return
+
         self.client = Groq(api_key=api_key)
-        
-        logger.info("Groq Parser inicializado (100% GRÁTIS, ultra-rápido)")
-    
+        logger.info("Groq Parser inicializado (Plan B ativo, model=%s)", self.model)
+
     def parse_resumo(self, page_text: str, page_num: int) -> Optional[Dict]:
         """
         Extrai os 8 campos do resumo mensal.
         O Groq é muito bom em filtrar ruídos, então enviamos um bloco generoso.
         """
+        if not self.enabled or not self.client:
+            return None
         try:
             import re
             
@@ -72,10 +72,10 @@ class GroqParser:
             
             prompt = self._build_prompt(texto_relevante)
             
-            logger.info(f"Página {page_num}: Enviando para Groq (Llama 3.3 70B)...")
+            logger.info(f"Página {page_num}: Enviando para Groq ({self.model})...")
             
             response = self.client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model=self.model,
                 messages=[
                     {"role": "system", "content": "Você é um extrator de dados financeiros especialista em extratos do Banco do Brasil. Retorne APENAS JSON."},
                     {"role": "user", "content": prompt}
@@ -104,6 +104,8 @@ class GroqParser:
         """
         Extrai transações da conta corrente usando Groq.
         """
+        if not self.enabled or not self.client:
+            return None
         try:
             # Filtro básico
             indicios = ["LANÇAMENTOS", "DATA", "HISTÓRICO", "VALOR", "SALDO"]
@@ -116,7 +118,7 @@ class GroqParser:
             prompt = self._build_cc_prompt(page_text[:6000])
             
             response = self.client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model=self.model,
                 messages=[
                     {"role": "system", "content": "Você é um extrator de dados bancários especialista em Banco do Brasil. Retorne APENAS um objeto JSON."},
                     {"role": "user", "content": prompt}

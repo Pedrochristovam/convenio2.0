@@ -50,7 +50,128 @@ class MonthlySummaryParser:
         except:
             return None
 
-    def is_math_valid(self, campos: Dict[str, Any]) -> bool:
+    @staticmethod
+    def normalize_ocr_text(text: str) -> str:
+        """Corrige milhares com espaço do Tesseract: '61 760,38' -> '61.760,38'."""
+        if not text:
+            return ""
+        text = re.sub(
+            r'(\d{1,3}(?:[ \t]\d{3})+),\s*(\d{2})\b',
+            lambda m: m.group(0).replace(' ', '.').replace('\t', '.'),
+            text,
+        )
+        text = re.sub(r',\s+(\d{2})\b', r',\1', text)
+        return text
+
+    def parse_resumo_by_labels(self, page_text: str, page_num: int) -> Optional[Dict[str, Any]]:
+        """Extrai pelos rótulos do bloco Resumo do mês (mais robusto ao OCR ruidoso)."""
+        text = self.normalize_ocr_text(page_text)
+        upper = text.upper().replace('ÃŠ', 'E').replace('Ã', 'A')
+
+        # Isola bloco a partir de RESUMO DO / SALDO ANTERIOR do resumo
+        start = None
+        for pat in [r'RESUMO\s+DO', r'SALDO\s+ANTERIOR']:
+            m = re.search(pat, upper)
+            if m:
+                # Prefer the RESUMO DO start if present
+                if 'RESUMO' in pat or start is None:
+                    start = m.start()
+                    if 'RESUMO' in pat:
+                        break
+        if start is None:
+            return None
+
+        bloco = text[start:start + 1200]
+        bloco_u = bloco.upper().replace('ÃŠ', 'E').replace('Ã', 'A')
+
+        label_patterns = [
+            ("saldo_anterior", r"SALDO\s+ANTERIOR"),
+            ("aplicacoes", r"APLICA\w*"),
+            ("resgates", r"RESGATE\w*"),
+            ("rendimento_bruto", r"RENDIMENTO\s+BRUTO"),
+            ("imposto_renda", r"IMPOSTO\s+(DE\s+)?RENDA|IRRF"),
+            ("iof", r"\bIOF\b"),
+            ("rendimento_liquido", r"RENDIMENTO\s+L[IÍ]QUIDO"),
+            ("saldo_atual", r"SALDO\s+ATUAL"),
+        ]
+
+        money_re = re.compile(
+            r'(-?\d{1,3}(?:\.\d{3})*,\d{2})|(-?\d+,\d{2})'
+        )
+
+        campos: Dict[str, float] = {}
+        search_from = 0
+        for key, lpat in label_patterns:
+            lm = re.search(lpat, bloco_u[search_from:], re.IGNORECASE)
+            if not lm:
+                continue
+            abs_pos = search_from + lm.end()
+            # valor na mesma região (até ~80 chars após o label)
+            window = bloco[abs_pos:abs_pos + 80]
+            mm = money_re.search(window)
+            if not mm:
+                continue
+            val = self.clean_value(mm.group(0))
+            if val is None:
+                continue
+            campos[key] = val
+            search_from = abs_pos
+
+        if len(campos) < 6:
+            return None
+
+        # completa faltantes com 0
+        for k in self.campos_ordem:
+            campos.setdefault(k, 0.0)
+
+        math_ok, math_debug = self.is_math_valid(campos)
+        # Reparo OCR: se a conta não fecha, deriva saldo_anterior pela equação
+        # SA + APL - RES + RL = ST  =>  SA = ST - APL + RES - RL
+        if not math_ok:
+            st = campos.get("saldo_atual") or 0.0
+            rl = campos.get("rendimento_liquido") or 0.0
+            apl = campos.get("aplicacoes") or 0.0
+            res = campos.get("resgates") or 0.0
+            if abs(st) > 0.01:
+                inferred_sa = round(st - apl + res - rl, 2)
+                old_sa = campos.get("saldo_anterior") or 0.0
+                if abs(inferred_sa - old_sa) >= 0.5:
+                    campos["saldo_anterior"] = inferred_sa
+                    math_ok, math_debug = self.is_math_valid(campos)
+                    if math_ok:
+                        math_debug = f"SA corrigido por equacao OCR ({old_sa} -> {inferred_sa})"
+                    else:
+                        # ainda aceita near-match
+                        calc = inferred_sa + apl - res + rl
+                        if abs(calc - st) < 1.0:
+                            math_ok = True
+                            math_debug = f"Label near-match após correção SA Diff={abs(calc-st):.2f}"
+
+        if not math_ok:
+            sa = campos.get("saldo_anterior", 0) or 0
+            st = campos.get("saldo_atual", 0) or 0
+            rl = campos.get("rendimento_liquido", 0) or 0
+            calc = sa + (campos.get("aplicacoes") or 0) - (campos.get("resgates") or 0) + rl
+            if abs(calc - st) < 1.0 and abs(sa) > 0.01 and abs(st) > 0.01:
+                math_ok = True
+                math_debug = f"Label-based near-match Diff={abs(calc-st):.2f}"
+
+        if abs(campos.get("saldo_anterior", 0) or 0) < 0.01 and abs(campos.get("saldo_atual", 0) or 0) < 0.01:
+            return None
+
+        logger.info(
+            "Pagina %s: extração por rótulos (math_ok=%s)",
+            page_num, math_ok,
+        )
+        return {
+            "tipo": "RESUMO_MENSAL",
+            "pagina": page_num,
+            "campos": {k: campos.get(k, 0.0) for k in self.campos_ordem},
+            "math_error": not math_ok,
+            "math_debug": math_debug if isinstance(math_debug, str) else str(math_debug),
+        }
+
+    def is_math_valid(self, campos: Dict[str, Any]):
         """
         Garante que a conta fecha e que pelo menos um valor é relevante.
         """
@@ -82,6 +203,13 @@ class MonthlySummaryParser:
         Extrai o resumo mensal buscando qualquer sequência de 8 números que feche a conta.
         Ignora labels corrompidas e foca na verificação matemática.
         """
+        page_text = self.normalize_ocr_text(page_text)
+
+        # 0) Tentativa por rótulos (melhor com OCR Tesseract)
+        by_labels = self.parse_resumo_by_labels(page_text, page_num)
+        if by_labels and not by_labels.get("math_error"):
+            return by_labels
+
         # 1. Limpeza agressiva de OCR (Remove caracteres que quebram números)
         # Mantém apenas números, vírgulas, pontos e espaços
         clean_text = page_text.replace('|', ' ').replace(']', ' ').replace('[', ' ')
@@ -99,7 +227,7 @@ class MonthlySummaryParser:
         
         if len(all_vals) < 8:
             logger.debug(f"Pagina {page_num}: Apenas {len(all_vals)} valores encontrados. Ignorando.")
-            return None
+            return by_labels  # pode ter math_error mas ainda útil para Groq fallback path
 
         # 3. VERIFICAÇÃO DE CONTEXTO: Deve haver palavras-chave de extrato na página
         # Normalização básica para evitar erros de encoding no OCR (MÃŠS -> MES)
@@ -113,7 +241,7 @@ class MonthlySummaryParser:
         
         if not (has_resumo_header or has_bank_context):
             logger.debug(f"Página {page_num}: Contexto bancário não identificado. Ignorando.")
-            return None
+            return by_labels
 
         # 4. ESTRATÉGIA: Sliding Window Global
         # Testa TODAS as sequências de 8 números na página
@@ -168,7 +296,7 @@ class MonthlySummaryParser:
                 "math_debug": f"Janela imperfeita (Diff: {best_diff:.2f})"
             }
 
-        return None
+        return by_labels
 
     def parse_all_pages(self, pages_texts: list) -> Dict[int, Dict[str, Any]]:
         resumos = {}
