@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Optional
 import logging
 import json
 import os
+import re
 from dotenv import load_dotenv
 # Carrega .env do diretório raiz do projeto (um nível acima de /backend)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -19,6 +20,109 @@ db_user = os.getenv("MYSQL_USER", "root")
 db_name = os.getenv("MYSQL_DATABASE", "convenio2")
 logger.info(f"DB CONFIG: Host={db_host}, User={db_user}, DB={db_name} (Loaded from {ENV_PATH})")
 
+# Com DATABASE_URL (PostgreSQL do Render) o mesmo SQL escrito para MySQL é traduzido em _CursorPg
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+
+# Chave única usada pelos "ON DUPLICATE KEY UPDATE" de cada tabela (no PostgreSQL vira ON CONFLICT)
+CHAVES_UNICAS = {
+    "ocr_paginas": "arquivo_nome, data_processamento, pagina",
+    "pasta_arquivos": "arquivo_nome",
+}
+
+
+def _tipo_pg(definicao: str) -> str:
+    for de, para in (
+        (r"INT AUTO_INCREMENT PRIMARY KEY", "SERIAL PRIMARY KEY"),
+        (r"\b(?:MEDIUM|LONG)TEXT\b", "TEXT"),
+        (r"\bTINYINT\(1\)", "SMALLINT"),
+        (r"\bJSON\b", "TEXT"),
+        (r"\s+ON UPDATE CURRENT_TIMESTAMP", ""),
+    ):
+        definicao = re.sub(de, para, definicao)
+    return definicao
+
+
+def _ddl_pg(sql: str) -> List[str]:
+    """CREATE TABLE do MySQL -> comandos PostgreSQL (índices à parte e gatilho para updated_at)."""
+    tabela = re.search(r"CREATE TABLE IF NOT EXISTS (\w+)", sql).group(1)
+    corpo = sql[sql.index("(") + 1 : sql.rindex(")")]
+    colunas, extras = [], []
+    for linha in corpo.splitlines():
+        linha = linha.strip().rstrip(",")
+        if not linha:
+            continue
+        indice = re.match(r"INDEX (\w+) \((.+)\)$", linha)
+        unica = re.match(r"UNIQUE KEY (\w+) \((.+)\)$", linha)
+        if indice:
+            extras.append(f"CREATE INDEX IF NOT EXISTS {indice[1]} ON {tabela} ({indice[2]})")
+        elif unica:
+            colunas.append(f"CONSTRAINT {unica[1]} UNIQUE ({unica[2]})")
+        else:
+            colunas.append(_tipo_pg(linha))
+    comandos = [f"CREATE TABLE IF NOT EXISTS {tabela} ({', '.join(colunas)})"] + extras
+    if "ON UPDATE CURRENT_TIMESTAMP" in sql:
+        comandos += [
+            "CREATE OR REPLACE FUNCTION atualizar_updated_at() RETURNS trigger AS $$ "
+            "BEGIN NEW.updated_at = CURRENT_TIMESTAMP; RETURN NEW; END $$ LANGUAGE plpgsql",
+            f"DROP TRIGGER IF EXISTS trg_{tabela}_updated_at ON {tabela}",
+            f"CREATE TRIGGER trg_{tabela}_updated_at BEFORE UPDATE ON {tabela} "
+            "FOR EACH ROW EXECUTE FUNCTION atualizar_updated_at()",
+        ]
+    return comandos
+
+
+def _dml_pg(sql: str) -> str:
+    duplicado = re.search(r"ON DUPLICATE KEY UPDATE", sql)
+    if duplicado:
+        tabela = re.search(r"INSERT INTO (\w+)", sql).group(1)
+        sql = sql.replace(duplicado.group(0), f"ON CONFLICT ({CHAVES_UNICAS[tabela]}) DO UPDATE SET")
+        sql = re.sub(r"VALUES\((\w+)\)", r"EXCLUDED.\1", sql)
+    return sql
+
+
+class _CursorPg:
+    """Cursor psycopg2 com a interface usada aqui (dicts, lastrowid) e o SQL do MySQL traduzido."""
+
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.lastrowid = None
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+    def execute(self, sql: str, params=None):
+        if sql.lstrip().startswith("CREATE TABLE"):
+            for comando in _ddl_pg(sql):
+                self._cursor.execute(comando)
+            return
+        sql = _dml_pg(sql)
+        insercao = sql.lstrip().upper().startswith("INSERT")
+        if insercao:
+            sql = sql.rstrip().rstrip(";") + " RETURNING id"
+        if params is not None:
+            # PostgreSQL recusa o caractere NUL em texto (aparece em OCR de PDFs nativos)
+            params = tuple(p.replace("\x00", "") if isinstance(p, str) else p for p in params)
+        self._cursor.execute(sql, params)
+        self.lastrowid = self._cursor.fetchone()["id"] if insercao else None
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+
+class _ConexaoPg:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def cursor(self):
+        return _CursorPg(self._conn.cursor())
+
+    def close(self):
+        self._conn.close()
+
 
 class ExtractionDatabase:
     """
@@ -27,6 +131,7 @@ class ExtractionDatabase:
     """
     
     def __init__(self):
+        self.pg = bool(DATABASE_URL)
         self.host = os.getenv("MYSQL_HOST", "localhost")
         try:
             port_str = os.getenv("MYSQL_PORT", "3306").strip()
@@ -47,6 +152,23 @@ class ExtractionDatabase:
         self._init_database()
     
     def _get_connection(self):
+        if self.pg:
+            try:
+                import psycopg2
+                import psycopg2.extras
+
+                conn = psycopg2.connect(
+                    DATABASE_URL,
+                    cursor_factory=psycopg2.extras.RealDictCursor,
+                    connect_timeout=10,
+                    # Horário de Brasília em formato POSIX: não depende da base de fusos do servidor
+                    options="-c timezone=<-03>+03",
+                )
+                conn.autocommit = True
+                return _ConexaoPg(conn)
+            except Exception as e:
+                logger.error("Falha ao conectar PostgreSQL: %s", e)
+                return None
         try:
             return pymysql.connect(
                 host=self.host,
@@ -68,6 +190,8 @@ class ExtractionDatabase:
         """Obtém conexão ou levanta erro explícito (produção)."""
         conn = self._get_connection()
         if not conn:
+            if self.pg:
+                raise RuntimeError("PostgreSQL indisponível. Verifique DATABASE_URL e se o banco está ativo.")
             raise RuntimeError(
                 f"MySQL indisponível ({self.host}:{self.port}/{self.database}). "
                 "Verifique MYSQL_* no .env e se o serviço está rodando."
@@ -75,6 +199,9 @@ class ExtractionDatabase:
         return conn
 
     def _ensure_column(self, cursor, table: str, column: str, definition: str):
+        if self.pg:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {_tipo_pg(definition)}")
+            return
         cursor.execute(
             """
             SELECT COUNT(*) AS c FROM information_schema.COLUMNS
@@ -244,7 +371,7 @@ class ExtractionDatabase:
             self._ensure_column(cursor, "dossies", "pasta_id", "INT NULL")
 
             conn.close()
-            logger.info("✅ MySQL Conectado e Tabelas Verificadas.")
+            logger.info("✅ %s conectado e tabelas verificadas.", "PostgreSQL" if self.pg else "MySQL")
         except Exception as e:
             logger.error(f"❌ ERRO CRÍTICO NA CONEXÃO MYSQL: {e}")
             # Não levantamos erro aqui para não travar o backend no init, 
@@ -1140,15 +1267,25 @@ class ExtractionDatabase:
         if not conn:
             return
         cursor = conn.cursor()
-        cursor.execute(
-            """
-            UPDATE processamento_jobs j
-            INNER JOIN (SELECT arquivo_nome, MAX(id) AS max_id FROM processamento_jobs GROUP BY arquivo_nome) u
-                ON u.max_id = j.id
-            SET j.status = 'erro', j.mensagem = 'Interrompido (servidor reiniciado). Envie o arquivo novamente.'
-            WHERE j.status IN ('fila', 'processando')
-            """
-        )
+        if self.pg:
+            cursor.execute(
+                """
+                UPDATE processamento_jobs
+                SET status = 'erro', mensagem = 'Interrompido (servidor reiniciado). Envie o arquivo novamente.'
+                WHERE status IN ('fila', 'processando')
+                  AND id IN (SELECT MAX(id) FROM processamento_jobs GROUP BY arquivo_nome)
+                """
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE processamento_jobs j
+                INNER JOIN (SELECT arquivo_nome, MAX(id) AS max_id FROM processamento_jobs GROUP BY arquivo_nome) u
+                    ON u.max_id = j.id
+                SET j.status = 'erro', j.mensagem = 'Interrompido (servidor reiniciado). Envie o arquivo novamente.'
+                WHERE j.status IN ('fila', 'processando')
+                """
+            )
         cursor.execute(
             "UPDATE dossies SET status = 'erro', mensagem = 'Interrompido (servidor reiniciado). Clique em Reprocessar.' "
             "WHERE status = 'processando'"

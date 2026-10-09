@@ -1,3 +1,11 @@
+databases:
+  # PostgreSQL gratuito do Render (1 GB). Expira 30 dias após a criação: depois disso,
+  # apague-o e crie outro com o mesmo nome (o sistema recria as tabelas sozinho).
+  - name: convenio2-db
+    plan: free
+    databaseName: convenio2
+    user: convenio2
+
 services:
   # ----------------------------------------------------
   # 1. BACKEND (FastAPI + Tesseract + LibreOffice, via Docker)
@@ -18,19 +26,10 @@ services:
         generateValue: true
       - key: GROQ_API_KEY
         sync: false
-      # MySQL externo (o Render só oferece PostgreSQL gerenciado)
-      - key: MYSQL_HOST
-        sync: false
-      - key: MYSQL_PORT
-        sync: false
-      - key: MYSQL_USER
-        sync: false
-      - key: MYSQL_PASSWORD
-        sync: false
-      - key: MYSQL_DATABASE
-        sync: false
-      - key: MYSQL_SSL
-        value: "1"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: convenio2-db
+          property: connectionString
 
   # ----------------------------------------------------
   # 2. SITE ESTÁTICO (Frontend React/Vite)
