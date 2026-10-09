@@ -29,8 +29,8 @@ from urllib.parse import quote
 
 app = FastAPI(title="Convenio Extração API")
 
-if auth.em_producao() and not auth.ativo():
-    raise RuntimeError("APP_USERS não definido: em produção o sistema não sobe sem login.")
+if auth.em_producao() and not auth.ativo() and os.getenv("PERMITIR_SEM_LOGIN") != "1":
+    raise RuntimeError("APP_USERS não definido: em produção o sistema só sobe sem login com PERMITIR_SEM_LOGIN=1.")
 
 ROTAS_ABERTAS = {"/", "/auth/login", "/auth/status"}
 

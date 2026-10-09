@@ -19,9 +19,10 @@ services:
     plan: free
     healthCheckPath: /
     envVars:
-      # Usuários de acesso: "ana:senha1,joao:senha2" (sem isso o backend não sobe em produção)
-      - key: APP_USERS
-        sync: false
+      # Sem login: qualquer pessoa com o endereço acessa. Para ligar o login, crie no painel
+      # a variável APP_USERS ("ana:senha1,joao:senha2").
+      - key: PERMITIR_SEM_LOGIN
+        value: "1"
       - key: APP_SECRET
         generateValue: true
       - key: GROQ_API_KEY
