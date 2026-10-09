@@ -209,8 +209,9 @@ def _preencher_parecer(ws, wb, resultado: Dict[str, Any], info: Dict[str, Any]):
     _formulas_movimento(ws, linhas)
     if solicitar:
         mes, ano = (ult["mes"] + 1, ult["ano"]) if ult["mes"] < 12 else (1, ult["ano"] + 1)
-        _gravar(ws, f"C{linhas.start + len(lanc)}", f"solicitar a partir de {mes_extenso(mes, ano)}",
-                f"extratos apresentados até {ult.get('data')}", True)
+        ref = f"C{linhas.start + len(lanc)}"
+        _gravar(ws, ref, f"solicitar a partir de {mes_extenso(mes, ano)}", f"extratos apresentados até {ult.get('data')}")
+        ws[ref].font = Font(bold=True, color="FFFF0000")
 
     empresa = parecer.get("empresa")
     if empresa:

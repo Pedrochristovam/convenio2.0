@@ -36,6 +36,14 @@ class ExtractionDatabase:
         self.user = os.getenv("MYSQL_USER", "root")
         self.password = os.getenv("MYSQL_PASSWORD", "")
         self.database = os.getenv("MYSQL_DATABASE", "convenio2")
+        # MySQL gerenciado (Aiven, Railway...) exige TLS; com o certificado da CA a identidade do servidor é verificada
+        ca = (os.getenv("MYSQL_SSL_CA") or "").strip()
+        if ca:
+            self.ssl = {"ca": ca}
+        elif (os.getenv("MYSQL_SSL") or "").strip() == "1":
+            self.ssl = {"check_hostname": False}
+        else:
+            self.ssl = None
         self._init_database()
     
     def _get_connection(self):
@@ -50,6 +58,7 @@ class ExtractionDatabase:
                 autocommit=True,
                 connect_timeout=5,
                 charset="utf8mb4",
+                ssl=self.ssl,
             )
         except Exception as e:
             logger.error("Falha ao conectar MySQL: %s", e)

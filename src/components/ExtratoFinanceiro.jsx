@@ -1,6 +1,6 @@
 import React, { useCallback, useMemo, useState } from 'react'
 import { AlertTriangle, CheckCircle2, ChevronDown, Download, FileSpreadsheet, Loader2, Pencil, Save } from 'lucide-react'
-import { BACKEND_URL, fmtBRL } from '../lib/api'
+import { BACKEND_URL, fetchAuth, fmtBRL } from '../lib/api'
 
 const parseData = (s) => {
     if (!s) return new Date(NaN)
@@ -211,7 +211,7 @@ export default function ExtratoFinanceiro({ resultadoInicial, arquivo }) {
         try {
             const novos = { ...resumos }
             for (const e of Object.values(pendentes)) {
-                await fetch(`${BACKEND_URL}/resumo-mensal/${encodeURIComponent(arquivo)}/${e.pagina}`, {
+                await fetchAuth(`${BACKEND_URL}/resumo-mensal/${encodeURIComponent(arquivo)}/${e.pagina}`, {
                     method: 'PATCH',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ campo: e.campo, valor: e.depois }),
@@ -231,7 +231,7 @@ export default function ExtratoFinanceiro({ resultadoInicial, arquivo }) {
 
     const exportar = async (tipo) => {
         try {
-            const r = await fetch(`${BACKEND_URL}/export/${tipo}`, {
+            const r = await fetchAuth(`${BACKEND_URL}/export/${tipo}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ ...results, metodoCalculo: metodo, dataInicio, fatorCalculo: fatorManual ? parseFloat(fatorManual) : 1 }),

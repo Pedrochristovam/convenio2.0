@@ -1,4 +1,7 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, WebSocket, WebSocketDisconnect, BackgroundTasks
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from backend import auth
 from backend.extraction_service import ExtractionCoordinator, sanitize_filename
 from backend.models import DocumentResponse
 from backend.database import ExtractionDatabase
@@ -21,6 +24,22 @@ from datetime import datetime
 from urllib.parse import quote
 
 app = FastAPI(title="Convenio Extração API")
+
+if auth.em_producao() and not auth.ativo():
+    raise RuntimeError("APP_USERS não definido: em produção o sistema não sobe sem login.")
+
+ROTAS_ABERTAS = {"/", "/auth/login", "/auth/status"}
+
+
+# Declarado antes do CORS para que as respostas 401 também levem os cabeçalhos de CORS
+@app.middleware("http")
+async def exigir_login(request: Request, call_next):
+    if auth.ativo() and request.method != "OPTIONS" and request.url.path not in ROTAS_ABERTAS:
+        token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+        if not auth.validar(token):
+            return JSONResponse({"detail": "Login necessário."}, status_code=401)
+    return await call_next(request)
+
 
 # Configuração de CORS completa
 app.add_middleware(
@@ -51,6 +70,25 @@ logger = logging.getLogger(__name__)
 async def health_check():
     return {"status": "ok", "service": "convenio-extração"}
 
+
+class Login(BaseModel):
+    usuario: str
+    senha: str
+
+
+@app.get("/auth/status")
+async def status_login():
+    return {"login": auth.ativo(), "limpar_banco": auth.pode_limpar_banco()}
+
+
+@app.post("/auth/login")
+async def fazer_login(dados: Login):
+    token = auth.autenticar(dados.usuario, dados.senha)
+    if not token:
+        await asyncio.sleep(1)
+        raise HTTPException(status_code=401, detail="Usuário ou senha incorretos.")
+    return {"token": token, "usuario": dados.usuario.strip().lower()}
+
 @app.get("/test")
 async def test_endpoint():
     """Endpoint de teste para verificar conectividade"""
@@ -61,6 +99,9 @@ async def websocket_progress(websocket: WebSocket):
     """
     WebSocket para enviar progresso em tempo real
     """
+    if auth.ativo() and not auth.validar(websocket.query_params.get("token")):
+        await websocket.close(code=4401)
+        return
     await websocket.accept()
     active_websockets.add(websocket)
     logger.info("Cliente WebSocket conectado")
@@ -538,6 +579,8 @@ async def limpar_banco():
     """
     CUIDADO: Remove TODOS os dados do banco
     """
+    if not auth.pode_limpar_banco():
+        raise HTTPException(status_code=403, detail="Limpeza do banco desativada em produção.")
     try:
         resultado = db.limpar_banco()
         logger.warning(f"Banco de dados limpo: {resultado}")

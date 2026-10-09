@@ -1,8 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import {
-    AlertTriangle, ArrowRight, BookOpen, CheckCircle2, Folder, FolderOpen, FolderPlus, Inbox, Layers, Loader2, Search, Sparkles, UploadCloud,
+    AlertTriangle, ArrowRight, BookOpen, CheckCircle2, Folder, FolderOpen, FolderPlus, Inbox, Layers, Loader2, LogOut, Search, Sparkles, UploadCloud,
 } from 'lucide-react'
-import { api, fmtData, nomeLegivel, WS_URL } from './lib/api'
+import { api, EVENTO_SAIR, fmtData, nomeLegivel, obterToken, salvarToken, wsUrl } from './lib/api'
 import PastaView from './components/PastaView'
 import PastaModal from './components/PastaModal'
 import ComoUsar from './components/ComoUsar'
@@ -214,7 +214,73 @@ const telaDoHash = () => {
 
 const hashDaTela = (tela) => (typeof tela === 'number' ? `#/pasta/${tela}` : { sem_pasta: '#/sem-pasta', ajuda: '#/ajuda' }[tela] || '#/')
 
+function Login({ onEntrar }) {
+    const [usuario, setUsuario] = useState('')
+    const [senha, setSenha] = useState('')
+    const [enviando, setEnviando] = useState(false)
+    const [erro, setErro] = useState(null)
+
+    const entrar = async (e) => {
+        e.preventDefault()
+        setEnviando(true)
+        setErro(null)
+        try {
+            const d = await api('/auth/login', { method: 'POST', body: { usuario, senha } })
+            salvarToken(d.token)
+            onEntrar()
+        } catch (err) {
+            setErro(err.message)
+        } finally {
+            setEnviando(false)
+        }
+    }
+
+    return (
+        <div className="flex min-h-screen items-center justify-center bg-slate-950 px-6">
+            <form onSubmit={entrar} className="w-full max-w-sm rounded-2xl bg-white p-8 shadow-2xl">
+                <div className="flex items-center gap-3">
+                    <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-500 to-violet-500">
+                        <Layers className="h-5 w-5 text-white" />
+                    </div>
+                    <div>
+                        <p className="font-semibold text-slate-900">Convênio 2.0</p>
+                        <p className="text-xs text-slate-500">Auditoria de prestação de contas</p>
+                    </div>
+                </div>
+                <label className="mt-8 block text-sm font-medium text-slate-700">Usuário</label>
+                <input value={usuario} onChange={(e) => setUsuario(e.target.value)} autoFocus autoComplete="username"
+                    className="mt-1 w-full rounded-lg border-0 bg-slate-100 px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2" />
+                <label className="mt-4 block text-sm font-medium text-slate-700">Senha</label>
+                <input type="password" value={senha} onChange={(e) => setSenha(e.target.value)} autoComplete="current-password"
+                    className="mt-1 w-full rounded-lg border-0 bg-slate-100 px-3 py-2.5 text-sm outline-none ring-indigo-500 focus:ring-2" />
+                {erro && <p className="mt-3 text-sm text-rose-600">{erro}</p>}
+                <button type="submit" disabled={enviando || !usuario || !senha}
+                    className="mt-6 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 py-2.5 text-sm font-semibold text-white hover:bg-indigo-700 disabled:opacity-50">
+                    {enviando && <Loader2 className="h-4 w-4 animate-spin" />} Entrar
+                </button>
+            </form>
+        </div>
+    )
+}
+
 export default function App() {
+    const [config, setConfig] = useState(null)
+    const [logado, setLogado] = useState(!!obterToken())
+
+    useEffect(() => {
+        api('/auth/status').then(setConfig).catch(() => setConfig({ login: false, limpar_banco: true }))
+        const sair = () => setLogado(false)
+        window.addEventListener(EVENTO_SAIR, sair)
+        return () => window.removeEventListener(EVENTO_SAIR, sair)
+    }, [])
+
+    if (!config) return <div className="flex h-screen items-center justify-center"><Loader2 className="h-6 w-6 animate-spin text-indigo-500" /></div>
+    if (config.login && !logado) return <Login onEntrar={() => setLogado(true)} />
+    const sair = config.login ? () => { salvarToken(null); setLogado(false) } : null
+    return <Sistema podeLimpar={config.limpar_banco} onSair={sair} />
+}
+
+function Sistema({ podeLimpar, onSair }) {
     const [pastas, setPastas] = useState([])
     const [semPasta, setSemPasta] = useState([])
     const [stats, setStats] = useState(null)
@@ -254,7 +320,7 @@ export default function App() {
         let vivo = true
         let timer
         const conectar = () => {
-            ws = new WebSocket(WS_URL)
+            ws = new WebSocket(wsUrl())
             ws.onmessage = (ev) => {
                 const d = JSON.parse(ev.data)
                 if (d.arquivo && (d.type === 'PROGRESS' || !d.type)) {
@@ -364,7 +430,14 @@ export default function App() {
                     {offline && (
                         <p className="flex items-center gap-2 px-3 py-1 text-xs text-rose-400"><AlertTriangle className="h-3.5 w-3.5" /> Servidor fora do ar</p>
                     )}
-                    <button onClick={limparBanco} className="w-full px-3 py-1 text-left text-xs text-slate-600 hover:text-rose-400">Limpar todos os dados</button>
+                    {podeLimpar && (
+                        <button onClick={limparBanco} className="w-full px-3 py-1 text-left text-xs text-slate-600 hover:text-rose-400">Limpar todos os dados</button>
+                    )}
+                    {onSair && (
+                        <button onClick={onSair} className="flex w-full items-center gap-2 px-3 py-1 text-left text-xs text-slate-500 hover:text-white">
+                            <LogOut className="h-3.5 w-3.5" /> Sair
+                        </button>
+                    )}
                 </div>
             </aside>
 

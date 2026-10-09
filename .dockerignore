@@ -1,0 +1,12 @@
+.git
+.env
+.env.*
+node_modules
+dist
+src
+public
+_modelos_tmp
+_*.py
+_prompt_mestre.txt
+**/__pycache__
+*.log
