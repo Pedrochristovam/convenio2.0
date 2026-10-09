@@ -43,8 +43,6 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 20.0.0
+      # Endereço público do backend (o "host" do fromService é o da rede interna, que o navegador não alcança)
       - key: VITE_BACKEND_URL
-        fromService:
-          type: web
-          name: convenio2-backend
-          property: host
+        value: https://convenio2-backend.onrender.com
