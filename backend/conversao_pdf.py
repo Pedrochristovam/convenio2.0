@@ -43,9 +43,11 @@ def _via_libreoffice(origem: str, pasta: str) -> None:
     soffice = shutil.which("soffice") or r"C:\Program Files\LibreOffice\program\soffice.exe"
     if not os.path.exists(soffice):
         raise FileNotFoundError("LibreOffice não encontrado")
+    # Perfil fixo: sem ele cada conversão recria o perfil do zero, o que leva minutos na CPU do Render gratuito
+    perfil = "file:///" + os.path.join(tempfile.gettempdir(), "lo_perfil_convenio").replace("\\", "/").lstrip("/")
     subprocess.run(
-        [soffice, "--headless", "--convert-to", "pdf", "--outdir", pasta, origem],
-        check=True, capture_output=True, timeout=180,
+        [soffice, f"-env:UserInstallation={perfil}", "--headless", "--norestore", "--convert-to", "pdf", "--outdir", pasta, origem],
+        check=True, capture_output=True, timeout=int(os.getenv("PDF_TIMEOUT", "600")),
     )
 
 

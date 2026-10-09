@@ -6,8 +6,9 @@ services:
     name: convenio2-backend
     runtime: docker
     dockerfilePath: ./Dockerfile
-    # OCR de volumes com centenas de páginas não cabe em 512 MB
-    plan: standard
+    # Gratuito: 512 MB e 0,1 CPU. O OCR cabe (pico medido ~240 MB), mas é lento;
+    # o servidor se mantém acordado sozinho enquanto processa (RENDER_EXTERNAL_URL)
+    plan: free
     healthCheckPath: /
     envVars:
       # Usuários de acesso: "ana:senha1,joao:senha2" (sem isso o backend não sobe em produção)

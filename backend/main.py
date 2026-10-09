@@ -18,8 +18,12 @@ from backend.conversao_pdf import ConversaoPdfIndisponivel, docx_para_pdf
 
 import logging
 import asyncio
+import contextlib
 import json
 import os
+import tempfile
+
+import httpx
 from datetime import datetime
 from urllib.parse import quote
 
@@ -58,6 +62,38 @@ db.marcar_interrompidos()
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "100"))
 # OCR é a etapa pesada: volumes enviados juntos entram em fila em vez de disputar CPU/memória
 fila_ocr = asyncio.Semaphore(int(os.getenv("OCR_SIMULTANEOS", "1")))
+
+# O plano gratuito do Render desliga o servidor após 15 min sem requisições externas.
+# Enquanto houver OCR ou análise rodando, o próprio servidor chama a sua URL pública.
+URL_PUBLICA = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+tarefas_ativas = 0
+
+
+@contextlib.asynccontextmanager
+async def manter_acordado():
+    global tarefas_ativas
+    tarefas_ativas += 1
+    try:
+        yield
+    finally:
+        tarefas_ativas -= 1
+
+
+async def _despertador():
+    async with httpx.AsyncClient(timeout=30) as cliente:
+        while True:
+            await asyncio.sleep(300)
+            if tarefas_ativas:
+                try:
+                    await cliente.get(URL_PUBLICA + "/")
+                except Exception as exc:
+                    logger.warning("Despertador: falha ao chamar %s: %s", URL_PUBLICA, exc)
+
+
+@app.on_event("startup")
+async def iniciar_despertador():
+    if URL_PUBLICA:
+        app.state.despertador = asyncio.create_task(_despertador())
 
 # Gerenciador de conexões WebSocket ativas
 active_websockets = set()
@@ -163,13 +199,21 @@ async def extract_data(
         if job and job.get("status") in ("fila", "processando"):
             raise HTTPException(status_code=409, detail=f"{file.filename} já está sendo processado.")
 
-        file_content = await file.read()
+        # Volumes na fila esperam em disco: na memória, vários de 50 MB estourariam os 512 MB do plano gratuito
+        tamanho = 0
+        with tempfile.NamedTemporaryFile(prefix="fila_ocr_", suffix=".bin", delete=False) as tmp:
+            caminho_fila = tmp.name
+            while bloco := await file.read(1024 * 1024):
+                tamanho += len(bloco)
+                if tamanho > MAX_UPLOAD_MB * 1024 * 1024:
+                    break
+                tmp.write(bloco)
+        if tamanho > MAX_UPLOAD_MB * 1024 * 1024:
+            os.remove(caminho_fila)
+            logger.warning(f"Arquivo muito grande: {tamanho} bytes")
+            raise HTTPException(status_code=413, detail=f"Arquivo muito grande. Limite de {MAX_UPLOAD_MB} MB.")
 
-        if len(file_content) > MAX_UPLOAD_MB * 1024 * 1024:
-             logger.warning(f"Arquivo muito grande: {len(file_content)} bytes")
-             raise HTTPException(status_code=413, detail=f"Arquivo muito grande. Limite de {MAX_UPLOAD_MB} MB.")
-
-        logger.info(f"Arquivo validado: {file.filename} ({len(file_content)} bytes). Iniciando Background Task...")
+        logger.info(f"Arquivo validado: {file.filename} ({tamanho} bytes). Iniciando Background Task...")
 
         if pasta_id is not None:
             db.vincular_arquivo(pasta_id, arquivo)
@@ -188,14 +232,20 @@ async def extract_data(
                         "message": f"{file.filename}: na fila, aguardando o término do arquivo em processamento...",
                         "progress": 0,
                     })
-                async with fila_ocr:
+                async with manter_acordado(), fila_ocr:
+                    with open(caminho_fila, "rb") as f:
+                        file_content = f.read()
+                    os.remove(caminho_fila)
                     res = await coordinator.process_document_staged(
                         file_content,
                         arquivo_nome=file.filename,
                         progress_callback=progresso_do_arquivo
                     )
+                    del file_content
                 await broadcast_progress(res.model_dump() if hasattr(res, "model_dump") else res)
             except Exception as task_err:
+                if os.path.exists(caminho_fila):
+                    os.remove(caminho_fila)
                 logger.error(f"Erro na tarefa background: {task_err}", exc_info=True)
                 db.atualizar_job(arquivo, agora, "erro", mensagem=str(task_err))
                 await broadcast_progress({
@@ -291,7 +341,8 @@ async def _processar_dossie(dossie_id: int, arquivos: list):
         await broadcast_progress({"type": "DOSSIE_PROGRESS", "dossie_id": dossie_id, "message": msg, "progress": pct})
 
     try:
-        resultado = await executar_analise(db, arquivos, llm=get_llm(), progress=progresso)
+        async with manter_acordado():
+            resultado = await executar_analise(db, arquivos, llm=get_llm(), progress=progresso)
         db.atualizar_dossie(dossie_id, status="concluido", progresso=100, mensagem="Concluído", resultado=resultado)
         await broadcast_progress({"type": "DOSSIE_DONE", "dossie_id": dossie_id, "progress": 100})
     except Exception as exc:

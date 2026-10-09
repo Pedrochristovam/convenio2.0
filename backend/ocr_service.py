@@ -164,7 +164,11 @@ class HybridOCR:
     def _page_to_png(self, page: fitz.Page, zoom: float = 2.5) -> bytes:
         # Cinza ocupa 1/3 da memória do RGB e o Tesseract binariza a imagem de qualquer forma
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csGRAY, alpha=False)
-        return pix.tobytes("png")
+        png = pix.tobytes("png")
+        # O PyMuPDF guarda cada imagem escaneada decodificada (~20 MB/página, até 256 MB);
+        # no plano gratuito do Render (512 MB) isso derruba o servidor.
+        fitz.TOOLS.store_shrink(100)
+        return png
 
     async def _extract_pdf_page(
         self, page: fitz.Page, page_num: int
